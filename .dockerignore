@@ -11,6 +11,7 @@ __pycache__/
 **/__pycache__/
 *.pyc
 *.pyo
+*.pyd
 
 # UV cache
 .uv/
@@ -18,26 +19,69 @@ __pycache__/
 # Git
 .git/
 .gitignore
+.git-blame-ignore-revs
 
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
+*.sublime-*
 
 # Build artifacts
 dist/
+build/
 *.egg-info/
 **/*.egg-info/
+*.whl
 
 # Test artifacts
 .pytest_cache/
+**/.pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+
+# Documentation
+docs/
+*.md
+!agents-core/README.md
+
+# CI/CD
+.github/
+.coderabbit.yaml
+.pre-commit-config.yaml
+
+# Environment files (handled separately)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+firebase-debug.log
 
 # Misc
 .DS_Store
-*.log
-.env
-.env.*
+Thumbs.db
+*.tmp
+*.temp
 
+# Docker files (avoid recursive includes)
+Dockerfile*
+docker-compose*.yml
+!Dockerfile
+!Dockerfile.dev
+!docker-compose.yml
+
+# Assets (if not needed in runtime)
+assets/
+
+# Node modules (frontend will install separately)
+web-ui/node_modules/
+web-ui/dist/
+web-ui/.vite/

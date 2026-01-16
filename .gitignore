@@ -1,3 +1,6 @@
+certs/
+csl
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -88,3 +91,6 @@ stream-py/
 profile.html
 
 /opencode.json
+inspect_stream.py
+node_modules/
+backend/knowledge/
