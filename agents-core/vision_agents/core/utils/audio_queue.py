@@ -75,7 +75,7 @@ class AudioQueue:
             new_duration_ms = (new_total_samples / item.sample_rate) * 1000
 
             if new_duration_ms > self.buffer_limit_ms:
-                logger.warning(
+                logger.debug(
                     f"AudioQueue buffer limit exceeded: {new_duration_ms:.1f}ms > {self.buffer_limit_ms}ms"
                 )
 

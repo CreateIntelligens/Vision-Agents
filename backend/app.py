@@ -24,6 +24,9 @@ from vision_agents.plugins import gemini, openai, getstream
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 降低 httpx 的日誌等級，避免洗版
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 load_dotenv()
 
 app = FastAPI(title="Vision Agent API")

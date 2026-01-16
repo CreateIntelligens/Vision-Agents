@@ -9,22 +9,12 @@ type AgentStatus = {
   model: string | null
 }
 
-type ModelType = 'gemini' | 'openai'
-type ExampleType = 'custom' | 'simple' | 'golf'
-
-const EXAMPLES = [
-  { value: 'custom', label: '自訂 Agent（繁體中文語音助理）', description: 'Gemini 2.5 Flash Realtime - 支援視訊與天氣查詢' },
-  { value: 'simple', label: 'Simple Agent（原始範例）', description: 'Deepgram + ElevenLabs + Gemini - 英文語音助理' },
-  { value: 'golf', label: 'Golf Coach（高爾夫教練）', description: 'Gemini Realtime 視訊教練 - 分析高爾夫揮桿動作' },
-]
-
 function App() {
   const [status, setStatus] = useState<AgentStatus>({
     running: false,
     call_id: null,
     model: null,
   })
-  const [selectedExample, setSelectedExample] = useState<ExampleType>('custom')
   const [loading, setLoading] = useState(false)
   const [demoUrl, setDemoUrl] = useState<string | null>(null)
 
@@ -53,7 +43,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'gemini',  // 統一使用 Gemini（支援視訊）
-          example: selectedExample
+          example: 'custom'  // 固定使用自訂 Agent
         }),
       })
       const data = await res.json()
@@ -133,21 +123,9 @@ function App() {
             exit={{ opacity: 0 }}
           >
             <div className="model-select-box">
-              <h3>📦 選擇 Agent 範例</h3>
-              <select
-                className="model-select example-select"
-                value={selectedExample}
-                onChange={(e) => setSelectedExample(e.target.value as ExampleType)}
-                disabled={loading}
-              >
-                {EXAMPLES.map((example) => (
-                  <option key={example.value} value={example.value}>
-                    {example.label}
-                  </option>
-                ))}
-              </select>
+              <h3>🤖 繁體中文 AI 語音助理</h3>
               <p className="example-description">
-                {EXAMPLES.find(e => e.value === selectedExample)?.description}
+                Gemini 2.5 Flash Realtime - 支援視訊、語音、文字與天氣查詢
               </p>
             </div>
 
@@ -212,12 +190,11 @@ function App() {
       <div className="info-box usage">
         <h3>💡 使用說明</h3>
         <ol>
-          <li>選擇 AI 模型（Gemini 支援視訊，OpenAI 僅語音）</li>
           <li>點擊「啟動 Agent」開始</li>
           <li>等待 Agent 準備完成</li>
           <li>點擊「開啟視訊通話」進入通話介面</li>
           <li>在瀏覽器中允許麥克風和攝影機權限</li>
-          <li>開始與 AI Agent 對話！</li>
+          <li>開始與 AI 對話（支援語音和文字輸入）</li>
         </ol>
       </div>
     </motion.div>
