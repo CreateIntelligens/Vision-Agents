@@ -75,6 +75,7 @@ from . import events
 from .agent_types import AgentOptions, LLMTurn, TrackInfo, default_agent_options
 from .conversation import Conversation
 from .transcript_buffer import TranscriptBuffer
+from .realtime_transcript_buffer import RealtimeTranscriptBuffer
 
 if TYPE_CHECKING:
     from vision_agents.plugins.getstream.stream_edge_transport import (
@@ -202,6 +203,13 @@ class Agent:
         self._pending_user_transcripts: Dict[str, TranscriptBuffer] = defaultdict(
             TranscriptBuffer
         )
+
+        # Realtime transcript buffers for accumulating speech fragments
+        # These buffers collect short text fragments and flush them as complete sentences
+        self._agent_transcript_buffer: Optional[RealtimeTranscriptBuffer] = None
+        self._user_transcript_buffers: Dict[str, RealtimeTranscriptBuffer] = {}
+        self._agent_transcript_message_id: Optional[str] = None
+        self._user_transcript_message_ids: Dict[str, str] = {}
 
         # Merge plugin events BEFORE subscribing to any events
         for plugin in [stt, tts, turn_detection, llm, edge, profiler]:
@@ -394,46 +402,82 @@ class Agent:
         async def on_realtime_user_speech_transcription(
             event: RealtimeUserSpeechTranscriptionEvent,
         ):
-            self.logger.info(f"🎤 [User transcript]: {event.text}")
+            self.logger.debug(f"🎤 [User transcript fragment]: {event.text}")
 
             if self.conversation is None or not event.text:
                 return
 
-            if user_id := event.user_id():
-                with self.span("agent.on_realtime_user_speech_transcription"):
-                    await self.conversation.upsert_message(
-                        message_id=str(uuid.uuid4()),
-                        role="user",
-                        user_id=user_id,
-                        content=event.text,
-                        completed=True,
-                        replace=True,
-                        original=event,
-                    )
-            else:
+            user_id = event.user_id()
+            if not user_id:
                 self.logger.info(
                     "RealtimeUserSpeechTranscriptionEvent event does not contain a user, skip sync to chat"
                 )
+                return
+
+            # 使用緩衝器累積文字片段，發送完整句子
+            if user_id not in self._user_transcript_buffers:
+                # 為這個用戶創建固定的 message_id
+                self._user_transcript_message_ids[user_id] = str(uuid.uuid4())
+
+                async def flush_user_transcript(content: str, uid: str = user_id):
+                    if self.conversation is None:
+                        return
+                    self.logger.info(f"🎤 [User transcript]: {content}")
+                    with self.span("agent.on_realtime_user_speech_transcription"):
+                        await self.conversation.upsert_message(
+                            message_id=self._user_transcript_message_ids[uid],
+                            role="user",
+                            user_id=uid,
+                            content=content,
+                            completed=True,
+                            replace=True,
+                        )
+                    # 發送後創建新的 message_id 給下一個句子
+                    self._user_transcript_message_ids[uid] = str(uuid.uuid4())
+
+                self._user_transcript_buffers[user_id] = RealtimeTranscriptBuffer(
+                    flush_callback=flush_user_transcript,
+                    flush_interval_ms=800,
+                )
+
+            await self._user_transcript_buffers[user_id].append(event.text)
 
         @self.events.subscribe
         async def on_realtime_agent_speech_transcription(
             event: RealtimeAgentSpeechTranscriptionEvent,
         ):
-            self.logger.info(f"🎤 [Agent transcript]: {event.text}")
+            self.logger.debug(f"🎤 [Agent transcript fragment]: {event.text}")
 
             if self.conversation is None or not event.text:
                 return
 
-            with self.span("agent.on_realtime_agent_speech_transcription"):
-                await self.conversation.upsert_message(
-                    message_id=str(uuid.uuid4()),
-                    role="assistant",
-                    user_id=self.agent_user.id or "",
-                    content=event.text,
-                    completed=True,
-                    replace=True,
-                    original=event,
+            # 使用緩衝器累積文字片段，發送完整句子
+            if self._agent_transcript_buffer is None:
+                # 為這個回應創建固定的 message_id
+                self._agent_transcript_message_id = str(uuid.uuid4())
+
+                async def flush_agent_transcript(content: str):
+                    if self.conversation is None:
+                        return
+                    self.logger.info(f"🎤 [Agent transcript]: {content}")
+                    with self.span("agent.on_realtime_agent_speech_transcription"):
+                        await self.conversation.upsert_message(
+                            message_id=self._agent_transcript_message_id,
+                            role="assistant",
+                            user_id=self.agent_user.id or "",
+                            content=content,
+                            completed=True,
+                            replace=True,
+                        )
+                    # 發送後創建新的 message_id 給下一個句子
+                    self._agent_transcript_message_id = str(uuid.uuid4())
+
+                self._agent_transcript_buffer = RealtimeTranscriptBuffer(
+                    flush_callback=flush_agent_transcript,
+                    flush_interval_ms=800,
                 )
+
+            await self._agent_transcript_buffer.append(event.text)
 
         @self.llm.events.subscribe
         async def on_llm_response_sync_conversation(event: LLMResponseCompletedEvent):
