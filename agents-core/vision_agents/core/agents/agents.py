@@ -49,6 +49,7 @@ from ..llm.events import (
 from ..llm.llm import LLM, AudioLLM, VideoLLM
 from ..llm.realtime import Realtime
 from ..mcp import MCPBaseServer, MCPManager
+from ..observability.agent import AgentMetrics
 from ..processors.base_processor import (
     AudioProcessor,
     AudioPublisher,
@@ -260,6 +261,7 @@ class Agent:
         self._join_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._metrics = AgentMetrics()
 
     async def _finish_llm_turn(self):
         if self._pending_turn is None or self._pending_turn.response is None:
@@ -481,7 +483,8 @@ class Agent:
 
         @self.llm.events.subscribe
         async def on_llm_response_sync_conversation(event: LLMResponseCompletedEvent):
-            self.logger.info(f"🤖 [LLM response]: {event.text}")
+            if event.text:
+                self.logger.info(f"🤖 [LLM response]: {event.text}")
 
             if self.conversation is None:
                 return
@@ -626,6 +629,17 @@ class Agent:
             self._call_ended_event = asyncio.Event()
             self._joined_at = time.time()
             yield
+        except Exception as exc:
+            if self._closing or self._closed:
+                # Only log exceptions if the agent is already closing
+                # (e.g., when the call ended before the agent fully joined).
+                logger.warning(
+                    f"Failed to join the call because the agent is closing or already closed: {exc}"
+                )
+                # Yield to let the context manager proceed
+                yield
+            else:
+                raise
         finally:
             await self.close()
             self._end_tracing()
@@ -812,6 +826,10 @@ class Agent:
         self.clear_call_logging_context()
         self._closed = True
         self.logger.info("🤖 Agent stopped")
+
+    @property
+    def _closing(self):
+        return self._close_lock.locked()
 
     # ------------------------------------------------------------------
     # Logging context helpers
@@ -1418,6 +1436,10 @@ class Agent:
         return await asyncio.to_thread(
             lambda p: VideoFileTrack(p), self._video_track_override_path
         )
+
+    @property
+    def metrics(self) -> AgentMetrics:
+        return self._metrics
 
 
 def _is_audio_llm(llm: LLM | VideoLLM | AudioLLM) -> TypeGuard[AudioLLM]:

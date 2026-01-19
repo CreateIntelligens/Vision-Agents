@@ -1,3 +1,4 @@
+import time
 import uuid
 from typing import Optional, List, TYPE_CHECKING, Any, Dict, AsyncIterator
 
@@ -14,6 +15,7 @@ from vision_agents.core.llm.llm import LLM, LLMResponseEvent
 from vision_agents.core.llm.llm_types import ToolSchema, NormalizedToolCallItem
 
 from vision_agents.core.llm.events import (
+    LLMRequestStartedEvent,
     LLMResponseCompletedEvent,
     LLMResponseChunkEvent,
 )
@@ -218,6 +220,19 @@ class GeminiLLM(LLM):
         # If no tools and no thinking/media config needed, don't pass config
         # This preserves the system_instruction set during chat creation
 
+        # Emit request started event
+        self.events.send(
+            LLMRequestStartedEvent(
+                plugin_name="gemini",
+                model=self.model,
+                streaming=True,
+            )
+        )
+
+        # Track timing
+        request_start_time = time.perf_counter()
+        first_token_time: Optional[float] = None
+
         # Generate content using the client
         iterator: AsyncIterator[
             GenerateContentResponse
@@ -233,7 +248,19 @@ class GeminiLLM(LLM):
         async for chunk in iterator:
             response_chunk: GenerateContentResponse = chunk
             final_chunk = response_chunk
-            self._standardize_and_emit_event(response_chunk, text_parts, item_id, idx)
+
+            # Track time to first token
+            if first_token_time is None and hasattr(chunk, "text") and chunk.text:
+                first_token_time = time.perf_counter()
+
+            self._standardize_and_emit_event(
+                response_chunk,
+                text_parts,
+                item_id,
+                idx,
+                request_start_time=request_start_time,
+                first_token_time=first_token_time,
+            )
 
             # collect function calls as they stream
             try:
@@ -305,7 +332,12 @@ class GeminiLLM(LLM):
                     follow_up_last = chk
                     # TODO: unclear if this is correct (item_id and idx)
                     self._standardize_and_emit_event(
-                        chk, follow_up_text_parts, item_id, follow_up_idx
+                        chk,
+                        follow_up_text_parts,
+                        item_id,
+                        follow_up_idx,
+                        request_start_time=request_start_time,
+                        first_token_time=first_token_time,
                     )
 
                     # Check for new function calls
@@ -326,12 +358,38 @@ class GeminiLLM(LLM):
             total_text = "".join(text_parts)
             llm_response = LLMResponseEvent(final_chunk, total_text)
 
+        # Calculate timing metrics
+        latency_ms = (time.perf_counter() - request_start_time) * 1000
+        ttft_ms: Optional[float] = None
+        if first_token_time is not None:
+            ttft_ms = (first_token_time - request_start_time) * 1000
+
+        # Extract token usage from response if available
+        input_tokens: Optional[int] = None
+        output_tokens: Optional[int] = None
+        if (
+            final_chunk
+            and hasattr(final_chunk, "usage_metadata")
+            and final_chunk.usage_metadata
+        ):
+            usage = final_chunk.usage_metadata
+            input_tokens = getattr(usage, "prompt_token_count", None)
+            output_tokens = getattr(usage, "candidates_token_count", None)
+
         self.events.send(
             LLMResponseCompletedEvent(
                 plugin_name="gemini",
                 original=llm_response.original,
                 text=llm_response.text,
                 item_id=item_id,
+                latency_ms=latency_ms,
+                time_to_first_token_ms=ttft_ms,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=(input_tokens or 0) + (output_tokens or 0)
+                if input_tokens or output_tokens
+                else None,
+                model=self.model,
             )
         )
 
@@ -362,6 +420,8 @@ class GeminiLLM(LLM):
         text_parts: List[str],
         item_id: str,
         idx: int,
+        request_start_time: Optional[float] = None,
+        first_token_time: Optional[float] = None,
     ) -> Optional[LLMResponseEvent[Any]]:
         """
         Forwards the events and also send out a standardized version (the agent class hooks into that)
@@ -371,19 +431,33 @@ class GeminiLLM(LLM):
             events.GeminiResponseEvent(plugin_name="gemini", response_chunk=chunk)
         )
 
-        # Check if response has text content
-        if hasattr(chunk, "text") and chunk.text:
+        # Extract text directly from parts to avoid SDK warning when function_calls are present
+        # Using .text triggers "Warning: there are non-text parts in the response"
+        chunk_text = self._extract_text_from_chunk(chunk)
+        if chunk_text:
             self.events.send(
                 LLMResponseChunkEvent(
                     plugin_name="gemini",
                     content_index=idx,
                     item_id=item_id,
-                    delta=chunk.text,
+                    delta=chunk_text,
                 )
             )
-            text_parts.append(chunk.text)
+            text_parts.append(chunk_text)
 
         return None
+
+    @staticmethod
+    def _extract_text_from_chunk(chunk: GenerateContentResponse) -> str:
+        """Extract text from response chunk without triggering SDK warning."""
+        texts = []
+        if chunk.candidates:
+            for candidate in chunk.candidates:
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if part.text:
+                            texts.append(part.text)
+        return "".join(texts)
 
     def _convert_tools_to_provider_format(
         self, tools: List[ToolSchema]
