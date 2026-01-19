@@ -23,8 +23,15 @@ function App() {
   // 定期檢查狀態
   useEffect(() => {
     const checkStatus = async () => {
+      // 如果沒有 call_id，跳過檢查
+      if (!status.call_id) return
+
       try {
-        const res = await fetch('/api/status')
+        const res = await fetch('/api/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ call_id: status.call_id }),
+        })
         const data = await res.json()
         setStatus(data)
       } catch (error) {
@@ -32,10 +39,12 @@ function App() {
       }
     }
 
-    checkStatus()
-    const interval = setInterval(checkStatus, 5000)
-    return () => clearInterval(interval)
-  }, [])
+    if (status.call_id) {
+      checkStatus()
+      const interval = setInterval(checkStatus, 5000)
+      return () => clearInterval(interval)
+    }
+  }, [status.call_id])
 
   const startAgent = async () => {
     // 驗證名稱
@@ -68,6 +77,8 @@ function App() {
       const data = await res.json()
 
       if (data.success) {
+        // 直接跳轉到視訊通話
+        window.open(data.demo_url, '_blank')
         setDemoUrl(data.demo_url)
         setStatus({
           running: true,
@@ -85,8 +96,14 @@ function App() {
   }
 
   const stopAgent = async () => {
+    if (!status.call_id) return
+
     try {
-      await fetch('/api/stop', { method: 'POST' })
+      await fetch('/api/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ call_id: status.call_id }),
+      })
       setStatus({ running: false, call_id: null, model: null })
       setDemoUrl(null)
     } catch (error) {
@@ -230,13 +247,11 @@ function App() {
           >
             <div className="info-box">
               <h3>
-                <Phone size={20} aria-hidden="true" />
-                連線資訊
+                <Video size={20} aria-hidden="true" />
+                視訊通話已開啟
               </h3>
-              <p>Call ID:</p>
-              <div className="call-id">{status.call_id}</div>
-              <p className="model-info">
-                模型: {status.model === 'gemini' ? 'Gemini 2.5 Flash' : 'OpenAI GPT-4o'}
+              <p>
+                視訊通話已在新視窗開啟。如果沒有自動開啟，請點擊下方按鈕。
               </p>
               <motion.button
                 className="btn btn-primary"
@@ -245,7 +260,7 @@ function App() {
                 whileTap={{ scale: 0.98 }}
               >
                 <Video size={20} />
-                開啟視訊通話
+                重新開啟視訊通話
               </motion.button>
             </div>
 

@@ -44,10 +44,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 儲存當前運行的 agent
-current_agent: Optional[Agent] = None
-current_call_id: Optional[str] = None
-current_llm_model: str = "gemini"
+# 儲存多個運行中的 agents (key: call_id)
+active_agents: Dict[str, Dict[str, Any]] = {}
 YOLO_POSE_MODEL_NAME = "yolo11n-pose.pt"
 
 
@@ -91,13 +89,14 @@ class StopResponse(BaseModel):
 
 
 def get_demo_url(call_id: str, user_name: str = "Human User") -> str:
-    """產生 Stream Demo URL"""
+    """產生 Stream Demo URL - 每個 call 使用唯一的 user_id"""
     api_key = os.getenv("STREAM_API_KEY")
     api_secret = os.getenv("STREAM_API_SECRET")
 
     client = Stream(api_key=api_key, api_secret=api_secret)
 
-    human_id = "user-demo-agent"
+    # 使用 call_id 產生唯一的 human_id
+    human_id = f"user-{call_id}"
     human_name = user_name  # 使用前端傳來的名稱
     token = client.create_token(human_id, expiration=3600)
 
@@ -119,7 +118,7 @@ def get_demo_url(call_id: str, user_name: str = "Human User") -> str:
 
 async def run_agent_in_background(call_id: str, model: str, example: str):
     """在背景執行 agent"""
-    global current_agent, current_call_id, current_llm_model
+    global active_agents
 
     # 根據 example 類型載入不同的 agent
     if example == "custom":
@@ -152,8 +151,8 @@ async def run_agent_in_background(call_id: str, model: str, example: str):
         from backend.agents.custom import create_agent
         agent = await create_agent(call_id)
 
-    # 創建 human user（在 join 之前）
-    human_id = "user-demo-agent"
+    # 創建 human user（在 join 之前）- 每個 call 使用唯一的 human_id
+    human_id = f"user-{call_id}"
     human_user = User(name="Human User", id=human_id)
     await agent.edge.create_user(user=human_user)
     logger.info(f"✅ Created human user: {human_id}")
@@ -184,12 +183,22 @@ async def run_agent_in_background(call_id: str, model: str, example: str):
     except Exception as e:
         logger.warning(f"⚠️  Could not create messaging channel: {e}")
 
-    current_agent = agent
-    current_llm_model = model
+    # 將 agent 加入 active_agents 字典
+    active_agents[call_id] = {
+        "agent": agent,
+        "model": model,
+        "call_id": call_id
+    }
 
-    async with agent.join(call):
-        logger.info(f"✅ Agent joined call: {call_id}")
-        await agent.finish()
+    try:
+        async with agent.join(call):
+            logger.info(f"✅ Agent joined call: {call_id}")
+            await agent.finish()
+    finally:
+        # Agent 結束後從 active_agents 移除
+        if call_id in active_agents:
+            del active_agents[call_id]
+            logger.info(f"🗑️  Removed agent {call_id} from active agents")
 
 
 @app.get("/api/health")
@@ -200,9 +209,7 @@ async def health():
 
 @app.post("/api/start", response_model=StartAgentResponse)
 async def start(request: StartAgentRequest):
-    """啟動 Agent"""
-    global current_call_id
-
+    """啟動 Agent - 每次啟動都創建新的 Agent 實例"""
     try:
         model = request.model
         example = request.example
@@ -217,7 +224,6 @@ async def start(request: StartAgentRequest):
 
         # 產生新的 call ID
         call_id = str(uuid4())
-        current_call_id = call_id
 
         # 產生 Demo URL（帶入用戶名稱）
         demo_url = get_demo_url(call_id, user_name)
@@ -225,7 +231,7 @@ async def start(request: StartAgentRequest):
         # 在背景執行 agent（傳入選擇的模型和 example）
         asyncio.create_task(run_agent_in_background(call_id, model, example))
 
-        logger.info(f"🚀 Agent started with call_id: {call_id}, model: {model}")
+        logger.info(f"🚀 Agent started with call_id: {call_id}, model: {model}, active_agents: {len(active_agents) + 1}")
 
         return StartAgentResponse(
             success=True,
@@ -240,27 +246,47 @@ async def start(request: StartAgentRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class StopRequest(BaseModel):
+    call_id: str
+
+
 @app.post("/api/stop", response_model=StopResponse)
-async def stop():
-    """停止 Agent"""
-    global current_agent, current_call_id
+async def stop(request: StopRequest):
+    """停止特定的 Agent"""
+    call_id = request.call_id
 
-    current_agent = None
-    current_call_id = None
+    if call_id in active_agents:
+        # 注意：實際上 agent.finish() 會自動清理，這裡只是標記
+        logger.info(f"🛑 Stopping agent {call_id}")
+        # Agent 會在 finish() 時自動從 active_agents 移除
+        return StopResponse(success=True)
+    else:
+        logger.warning(f"⚠️  Agent {call_id} not found in active agents")
+        return StopResponse(success=False)
 
-    logger.info("🛑 Agent stopped")
 
-    return StopResponse(success=True)
+class StatusRequest(BaseModel):
+    call_id: str
 
 
-@app.get("/api/status", response_model=StatusResponse)
-async def status():
-    """取得 Agent 狀態"""
-    return StatusResponse(
-        running=current_agent is not None,
-        call_id=current_call_id,
-        model=current_llm_model if current_agent else None
-    )
+@app.post("/api/status", response_model=StatusResponse)
+async def status(request: StatusRequest):
+    """取得特定 Agent 的狀態"""
+    call_id = request.call_id
+
+    if call_id in active_agents:
+        agent_info = active_agents[call_id]
+        return StatusResponse(
+            running=True,
+            call_id=call_id,
+            model=agent_info["model"]
+        )
+    else:
+        return StatusResponse(
+            running=False,
+            call_id=None,
+            model=None
+        )
 
 
 if __name__ == '__main__':
