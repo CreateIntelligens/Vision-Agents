@@ -125,6 +125,7 @@ class GeminiRealtime(realtime.Realtime):
         client: Optional[genai.Client] = None,
         api_key: Optional[str] = None,
         file_search_store: Optional[FileSearchStore] = None,
+        enable_google_search: bool = False,
         fps: int = 1,
         **kwargs,
     ) -> None:
@@ -139,6 +140,7 @@ class GeminiRealtime(realtime.Realtime):
             api_key: Optional API key.
             file_search_store: Optional FileSearchStore for RAG functionality.
                 See: https://ai.google.dev/gemini-api/docs/file-search
+            enable_google_search: Enable built-in Google Search tool.
             fps: Frames per second for video input (default: 1).
             **kwargs: Additional arguments passed to parent class.
         """
@@ -146,6 +148,7 @@ class GeminiRealtime(realtime.Realtime):
         self.model = model
         self.connected: bool = False
         self.file_search_store = file_search_store
+        self.enable_google_search = enable_google_search
 
         http_options = http_options or HttpOptions(api_version="v1alpha")
 
@@ -377,6 +380,12 @@ class GeminiRealtime(realtime.Realtime):
             file_search_config = self.file_search_store.get_tool_config()
             tools.append(file_search_config)
             logger.info("Adding file search tool to Gemini Live config")
+
+        # Add Google Search tool if enabled
+        if self.enable_google_search:
+            # Add Google Search as a separate tool
+            tools.append({"google_search_retrieval": {}})
+            logger.info("Adding Google Search tool to Gemini Live config")
 
         if tools:
             config["tools"] = tools  # type: ignore[typeddict-item]
