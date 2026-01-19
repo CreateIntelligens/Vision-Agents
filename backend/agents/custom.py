@@ -202,7 +202,7 @@ async def sync_knowledge_store(file_search_store: gemini.GeminiFilesearchRAG) ->
         logger.info(f"✅ 完成同步 (新增: {files_to_upload}, 刪除: {files_to_delete})")
 
 
-async def create_agent(call_id: str) -> Agent:
+async def create_agent(call_id: str, user_name: str = "Human User") -> Agent:
     """建立自訂 Agent，包含 RAG 知識庫"""
 
     # 初始化 Gemini File Search（RAG）
@@ -225,7 +225,11 @@ async def create_agent(call_id: str) -> Agent:
     agent = Agent(
         edge=getstream.Edge(),
         agent_user=User(name="AI 助理", id="agent"),
-        instructions="""你是一個友善的繁體中文語音 AI 助理，具有視訊分析能力。
+        instructions=f"""你是一個友善的繁體中文語音 AI 助理，具有視訊分析能力。
+
+**用戶資訊**：
+- 用戶的名字是：{user_name}
+- 當用戶問你「我的名字是什麼」或類似問題時，你應該回答：{user_name}
 
 **視訊分析能力（最重要）**：
 - 你可以即時看到用戶的視訊畫面
@@ -247,7 +251,8 @@ async def create_agent(call_id: str) -> Agent:
 範例：
 - 用戶問「你看到什麼？」→ 分析當下視訊畫面並描述
 - 用戶問「Vision Agents 支援哪些模型？」→ 呼叫 search_knowledge("Vision Agents 支援的模型")
-- 用戶問「台北天氣如何？」→ 呼叫 get_weather("台北")""",
+- 用戶問「台北天氣如何？」→ 呼叫 get_weather("台北")
+- 用戶問「我的名字是什麼？」→ 回答：{user_name}""",
         llm=llm,
         processors=[ChatListenerProcessor()],
     )

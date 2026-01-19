@@ -116,7 +116,7 @@ def get_demo_url(call_id: str, user_name: str = "Human User") -> str:
     return f"{base_url}{call_id}?{urlencode(params)}"
 
 
-async def run_agent_in_background(call_id: str, model: str, example: str):
+async def run_agent_in_background(call_id: str, model: str, example: str, user_name: str = "Human User"):
     """在背景執行 agent"""
     global active_agents
 
@@ -125,7 +125,7 @@ async def run_agent_in_background(call_id: str, model: str, example: str):
         # 使用我們自訂的 Agent
         from backend.agents.custom import create_agent
         logger.info(f"🤖 Using Custom Agent (Gemini Realtime)")
-        agent = await create_agent(call_id)
+        agent = await create_agent(call_id, user_name)
 
     elif example == "simple":
         # 使用原始 example 的 create_agent
@@ -149,13 +149,13 @@ async def run_agent_in_background(call_id: str, model: str, example: str):
         # 其他 examples 暫時使用 custom
         logger.warning(f"⚠️  Example '{example}' not implemented yet, using custom")
         from backend.agents.custom import create_agent
-        agent = await create_agent(call_id)
+        agent = await create_agent(call_id, user_name)
 
     # 創建 human user（在 join 之前）- 每個 call 使用唯一的 human_id
     human_id = f"user-{call_id}"
-    human_user = User(name="Human User", id=human_id)
+    human_user = User(name=user_name, id=human_id)  # 使用用戶輸入的名稱
     await agent.edge.create_user(user=human_user)
-    logger.info(f"✅ Created human user: {human_id}")
+    logger.info(f"✅ Created human user: {human_id} with name: {user_name}")
 
     # 建立並加入通話
     call = await agent.create_call("default", call_id)
@@ -228,8 +228,8 @@ async def start(request: StartAgentRequest):
         # 產生 Demo URL（帶入用戶名稱）
         demo_url = get_demo_url(call_id, user_name)
 
-        # 在背景執行 agent（傳入選擇的模型和 example）
-        asyncio.create_task(run_agent_in_background(call_id, model, example))
+        # 在背景執行 agent（傳入選擇的模型、example 和用戶名稱）
+        asyncio.create_task(run_agent_in_background(call_id, model, example, user_name))
 
         logger.info(f"🚀 Agent started with call_id: {call_id}, model: {model}, active_agents: {len(active_agents) + 1}")
 
