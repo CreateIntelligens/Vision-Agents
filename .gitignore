@@ -94,3 +94,6 @@ profile.html
 inspect_stream.py
 node_modules/
 backend/knowledge/
+
+# Vite cache
+.vite/
