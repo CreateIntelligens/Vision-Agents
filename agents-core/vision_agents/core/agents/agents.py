@@ -1136,10 +1136,12 @@ class Agent:
                 return
 
         # Store track metadata
+        # Use LLM's fps if available, otherwise default to 5 FPS to reduce bandwidth
+        llm_fps = getattr(self.llm, 'fps', 5) if self.llm else 5
         forwarder = VideoForwarder(
             track,  # type: ignore[arg-type]
             max_buffer=30,
-            fps=30,  # Max FPS for the producer (individual consumers can throttle down)
+            fps=llm_fps,  # Use LLM's fps setting to match its requirements
             name=f"video_forwarder_{track_id}_{track_type}",
         )
         self._active_video_tracks[track_id] = TrackInfo(
@@ -1403,10 +1405,12 @@ class Agent:
             video_publisher = self.video_publishers[0]
             # TODO: some lLms like moondream publish video
             self._video_track = video_publisher.publish_video_track()
+            # Use LLM's fps if available, otherwise default to 5 FPS to reduce bandwidth
+            llm_fps = getattr(self.llm, 'fps', 5) if self.llm else 5
             forwarder = VideoForwarder(
                 self._video_track,  # type: ignore[arg-type]
                 max_buffer=30,
-                fps=30,  # Max FPS for the producer (individual consumers can throttle down)
+                fps=llm_fps,  # Use LLM's fps setting to match its requirements
                 name=f"video_forwarder_{video_publisher.name}",
             )
             self._active_video_tracks[self._video_track.id] = TrackInfo(

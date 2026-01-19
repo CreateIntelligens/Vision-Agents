@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 # 降低 httpx 的日誌等級，避免洗版
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# 降低 WebRTC 視訊解碼錯誤的日誌等級（網路不穩定時會有損壞的 frame）
+logging.getLogger("aiortc.codecs.vpx").setLevel(logging.ERROR)
+logging.getLogger("libav.libvpx").setLevel(logging.CRITICAL)
+
 load_dotenv()
 
 app = FastAPI(title="Vision Agent API")
@@ -66,6 +70,7 @@ async def startup_prefetch_models():
 class StartAgentRequest(BaseModel):
     model: str = "gemini"
     example: str = "custom"  # custom, simple, golf
+    user_name: str = "Human User"  # 用戶名稱
 
 
 class StartAgentResponse(BaseModel):
@@ -85,7 +90,7 @@ class StopResponse(BaseModel):
     success: bool
 
 
-def get_demo_url(call_id: str) -> str:
+def get_demo_url(call_id: str, user_name: str = "Human User") -> str:
     """產生 Stream Demo URL"""
     api_key = os.getenv("STREAM_API_KEY")
     api_secret = os.getenv("STREAM_API_SECRET")
@@ -93,10 +98,10 @@ def get_demo_url(call_id: str) -> str:
     client = Stream(api_key=api_key, api_secret=api_secret)
 
     human_id = "user-demo-agent"
-    human_name = "Human User"
+    human_name = user_name  # 使用前端傳來的名稱
     token = client.create_token(human_id, expiration=3600)
 
-    base_url = f"{os.getenv('EXAMPLE_BASE_URL', 'https://pronto.getstream.io')}/join/"
+    base_url = f"{os.getenv('EXAMPLE_BASE_URL', 'https://getstream.io/video/demos')}/join/"
     params = {
         "api_key": api_key,
         "token": token,
@@ -201,6 +206,7 @@ async def start(request: StartAgentRequest):
     try:
         model = request.model
         example = request.example
+        user_name = request.user_name
         supported_examples = {"custom", "simple", "golf"}
 
         if example not in supported_examples:
@@ -213,8 +219,8 @@ async def start(request: StartAgentRequest):
         call_id = str(uuid4())
         current_call_id = call_id
 
-        # 產生 Demo URL
-        demo_url = get_demo_url(call_id)
+        # 產生 Demo URL（帶入用戶名稱）
+        demo_url = get_demo_url(call_id, user_name)
 
         # 在背景執行 agent（傳入選擇的模型和 example）
         asyncio.create_task(run_agent_in_background(call_id, model, example))

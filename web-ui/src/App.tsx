@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Sparkles, Video, Loader2, Power, PowerOff } from 'lucide-react'
+import { Sparkles, Video, Loader2, Power, PowerOff, Bot, User, Phone, Lightbulb, AlertCircle, CheckCircle } from 'lucide-react'
 import './App.css'
 
 type AgentStatus = {
@@ -17,6 +17,8 @@ function App() {
   })
   const [loading, setLoading] = useState(false)
   const [demoUrl, setDemoUrl] = useState<string | null>(null)
+  const [userName, setUserName] = useState('')
+  const [nameError, setNameError] = useState('')
 
   // 定期檢查狀態
   useEffect(() => {
@@ -36,6 +38,22 @@ function App() {
   }, [])
 
   const startAgent = async () => {
+    // 驗證名稱
+    const trimmedName = userName.trim()
+    if (!trimmedName) {
+      setNameError('請輸入您的名稱')
+      return
+    }
+    if (trimmedName.length < 2) {
+      setNameError('名稱至少需要 2 個字')
+      return
+    }
+    if (trimmedName.length > 20) {
+      setNameError('名稱不能超過 20 個字')
+      return
+    }
+
+    setNameError('')
     setLoading(true)
     try {
       const res = await fetch('/api/start', {
@@ -43,7 +61,8 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: 'gemini',  // 統一使用 Gemini（支援視訊）
-          example: 'custom'  // 固定使用自訂 Agent
+          example: 'custom',  // 固定使用自訂 Agent
+          user_name: trimmedName  // 傳送用戶名稱
         }),
       })
       const data = await res.json()
@@ -123,11 +142,64 @@ function App() {
             exit={{ opacity: 0 }}
           >
             <div className="model-select-box">
-              <h3>🤖 繁體中文 AI 語音助理</h3>
+              <h3>
+                <Bot size={24} aria-hidden="true" />
+                繁體中文 AI 語音助理
+              </h3>
               <p className="example-description">
                 Gemini 2.5 Flash Realtime - 支援視訊、語音、文字與天氣查詢
               </p>
             </div>
+
+            <motion.div
+              className="name-input-container"
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.1 }}
+            >
+              <label className="name-label">
+                <span className="label-text">
+                  <User size={16} aria-hidden="true" />
+                  您的名稱
+                </span>
+                <motion.input
+                  type="text"
+                  className={`name-input ${nameError ? 'error' : ''}`}
+                  placeholder="請輸入您的名稱..."
+                  value={userName}
+                  onChange={(e) => {
+                    setUserName(e.target.value)
+                    setNameError('')
+                  }}
+                  maxLength={20}
+                  disabled={loading}
+                  whileFocus={{ scale: 1.01 }}
+                />
+              </label>
+              {nameError && (
+                <motion.p
+                  className="name-error"
+                  role="alert"
+                  aria-live="polite"
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                >
+                  <AlertCircle size={16} aria-hidden="true" />
+                  {nameError}
+                </motion.p>
+              )}
+              {userName && !nameError && (
+                <motion.p
+                  className="name-hint"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                >
+                  <CheckCircle size={16} aria-hidden="true" />
+                  這個名稱會顯示在視訊通話中
+                </motion.p>
+              )}
+            </motion.div>
 
             <motion.button
               className="btn btn-primary"
@@ -157,7 +229,10 @@ function App() {
             exit={{ opacity: 0 }}
           >
             <div className="info-box">
-              <h3>📞 連線資訊</h3>
+              <h3>
+                <Phone size={20} aria-hidden="true" />
+                連線資訊
+              </h3>
               <p>Call ID:</p>
               <div className="call-id">{status.call_id}</div>
               <p className="model-info">
@@ -188,7 +263,10 @@ function App() {
       </AnimatePresence>
 
       <div className="info-box usage">
-        <h3>💡 使用說明</h3>
+        <h3>
+          <Lightbulb size={20} aria-hidden="true" />
+          使用說明
+        </h3>
         <ol>
           <li>點擊「啟動 Agent」開始</li>
           <li>等待 Agent 準備完成</li>

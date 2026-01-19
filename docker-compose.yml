@@ -14,8 +14,10 @@ services:
       - "8910:443"
 
     depends_on:
-      - backend
-      - frontend
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
 
   # ============================================
   # Backend API (FastAPI)
@@ -49,6 +51,13 @@ services:
         uv pip install fastapi uvicorn[standard] python-dotenv getstream pydantic &&
         cd backend && python app.py
       "
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8910/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
 
   # ============================================
   # Frontend (React + Vite)

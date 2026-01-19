@@ -122,25 +122,25 @@ class ChatListenerProcessor(Processor):
 
                             self._processed_message_ids.add(message_id)
 
-                            # 印出新訊息詳情
-                            logger.info(f"📝 新訊息: id={message_id[:8]}..., user={user_id}, text={text[:100]}")
-
                             # 跳過 agent 自己的訊息
                             if user_id == self.agent.agent_user.id:
-                                logger.info(f"⏭️  跳過 agent 訊息 (user_id={user_id})")
+                                logger.debug(f"⏭️  跳過 agent 訊息 (user_id={user_id})")
                                 continue
 
                             # 跳過空訊息
                             if not text or not text.strip():
-                                logger.info(f"⏭️  跳過空訊息")
+                                logger.debug(f"⏭️  跳過空訊息")
                                 continue
 
                             # 跳過語音轉文字產生的訊息（這些會有 custom.chunk_group 標記）
                             if hasattr(msg, 'custom') and msg.custom and 'chunk_group' in msg.custom:
-                                logger.info(f"⏭️  跳過語音轉文字訊息（chunk_group={msg.custom.get('chunk_group')}）")
+                                logger.debug(f"⏭️  跳過語音轉文字訊息（chunk_group={msg.custom.get('chunk_group')}）")
                                 continue
 
                             logger.info(f"📩 收到用戶文字訊息: {text}")
+
+                            # 等待 1 秒讓最新的視訊幀先被發送（fps=2，所以至少會有 2 幀更新）
+                            await asyncio.sleep(1.0)
 
                             # 發送給 Gemini Realtime
                             try:
@@ -219,27 +219,34 @@ async def create_agent(call_id: str) -> Agent:
     # 使用 Gemini Realtime（支援視訊）
     llm = gemini.Realtime(
         "gemini-2.5-flash-native-audio-preview-12-2025",
+        fps=2,  # 提高到 2 FPS 減少延遲（JPEG 壓縮後記憶體使用約 360-720MB/小時）
     )
 
     agent = Agent(
         edge=getstream.Edge(),
         agent_user=User(name="AI 助理", id="agent"),
-        instructions="""你是一個友善的繁體中文語音 AI 助理。
+        instructions="""你是一個友善的繁體中文語音 AI 助理，具有視訊分析能力。
+
+**視訊分析能力（最重要）**：
+- 你可以即時看到用戶的視訊畫面
+- 當用戶問「你看到什麼？」、「這是什麼？」、「畫面上有什麼？」時，你必須分析當下的視訊畫面並回答
+- 你看到的是即時畫面，每秒更新 2 次
+- 永遠基於「當下最新的畫面」來回答，不要參考過去的畫面
 
 你可以：
-1. 回答關於 Vision Agents 框架的問題 - **當用戶問到 Vision Agents、框架功能、支援的模型、應用場景等問題時，務必使用 search_knowledge 函數搜索知識庫**
-2. 查詢任何位置的天氣 - 使用 get_weather 函數
-3. 進行視訊對話和分析
+1. **視訊分析** - 分析用戶的即時視訊畫面，描述看到的物體、場景、文字等
+2. 回答關於 Vision Agents 框架的問題 - 使用 search_knowledge 函數搜索知識庫
+3. 查詢任何位置的天氣 - 使用 get_weather 函數
 
 重要規則：
-- 當用戶詢問 Vision Agents 相關問題時，必須先呼叫 search_knowledge 搜索知識庫，再用搜索結果回答
+- **當用戶問關於畫面的問題時，立即分析最新的視訊幀，不要說「我看不到」或參考舊畫面**
+- 當用戶詢問 Vision Agents 相關問題時，必須先呼叫 search_knowledge 搜索知識庫
 - 請用繁體中文回答，保持簡短、對話式的風格
 - 不要使用特殊符號或格式，保持親切友善
-- 如果知識庫中找不到答案，誠實地說你不知道
 
 範例：
+- 用戶問「你看到什麼？」→ 分析當下視訊畫面並描述
 - 用戶問「Vision Agents 支援哪些模型？」→ 呼叫 search_knowledge("Vision Agents 支援的模型")
-- 用戶問「這個框架有什麼功能？」→ 呼叫 search_knowledge("Vision Agents 主要功能")
 - 用戶問「台北天氣如何？」→ 呼叫 get_weather("台北")""",
         llm=llm,
         processors=[ChatListenerProcessor()],
