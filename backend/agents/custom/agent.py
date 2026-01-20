@@ -1,13 +1,11 @@
 """
 自訂 Agent - 繁體中文語音助理
-使用 Gemini 2.5 Flash Realtime，支援視訊、RAG 知識庫和天氣查詢
+使用 Gemini 2.5 Flash Realtime，支援視訊、RAG 知識庫和 Google Search
 """
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Any
 from vision_agents.core import Agent, User
-from vision_agents.core.utils.examples import get_weather_by_location
 from vision_agents.plugins import gemini, getstream
 from vision_agents.core.processors import Processor
 import datetime
@@ -220,12 +218,13 @@ async def create_agent(call_id: str, user_name: str = "Human User") -> Agent:
     llm = gemini.Realtime(
         "gemini-2.5-flash-native-audio-preview-12-2025",
         fps=2,  # 提高到 2 FPS 減少延遲（JPEG 壓縮後記憶體使用約 360-720MB/小時）
+        enable_google_search=True,  # 啟用 Google Search 進行即時資訊查詢
     )
 
     agent = Agent(
         edge=getstream.Edge(),
         agent_user=User(name="AI 助理", id="agent"),
-        instructions=f"""你是一個友善的繁體中文語音 AI 助理，具有視訊分析能力。
+        instructions=f"""你是一個友善的繁體中文語音 AI 助理，具有視訊分析和上網搜尋能力。
 
 **用戶資訊**：
 - 用戶的名字是：{user_name}
@@ -237,13 +236,17 @@ async def create_agent(call_id: str, user_name: str = "Human User") -> Agent:
 - 你看到的是即時畫面，每秒更新 2 次
 - 永遠基於「當下最新的畫面」來回答，不要參考過去的畫面
 
+**即時資訊查詢能力**：
+- 你可以使用 Google Search 來查詢最新的天氣、新聞、股價、比賽比分等資訊
+- 當用戶問「台北天氣如何？」、「今天有什麼新聞？」時，請直接使用搜尋工具
+
 你可以：
 1. **視訊分析** - 分析用戶的即時視訊畫面，描述看到的物體、場景、文字等
-2. 回答關於 Vision Agents 框架的問題 - 使用 search_knowledge 函數搜索知識庫
-3. 查詢任何位置的天氣 - 使用 get_weather 函數
+2. **回答關於 Vision Agents 框架的問題** - 使用 search_knowledge 函數搜索知識庫
+3. **查詢即時資訊** - 自動使用 Google Search 工具（無須調用函數）
 
 重要規則：
-- **當用戶問關於畫面的問題時，立即分析最新的視訊幀，不要說「我看不到」或參考舊畫面**
+- **當用戶問關於畫面的問題時，立即分析最新的視訊幀**
 - 當用戶詢問 Vision Agents 相關問題時，必須先呼叫 search_knowledge 搜索知識庫
 - 請用繁體中文回答，保持簡短、對話式的風格
 - 不要使用特殊符號或格式，保持親切友善
@@ -251,7 +254,7 @@ async def create_agent(call_id: str, user_name: str = "Human User") -> Agent:
 範例：
 - 用戶問「你看到什麼？」→ 分析當下視訊畫面並描述
 - 用戶問「Vision Agents 支援哪些模型？」→ 呼叫 search_knowledge("Vision Agents 支援的模型")
-- 用戶問「台北天氣如何？」→ 呼叫 get_weather("台北")
+- 用戶問「台北天氣如何？」→ 自動使用 Google Search
 - 用戶問「我的名字是什麼？」→ 回答：{user_name}""",
         llm=llm,
         processors=[ChatListenerProcessor()],
@@ -267,11 +270,26 @@ async def create_agent(call_id: str, user_name: str = "Human User") -> Agent:
             logger.error(f"知識庫搜索出錯: {e}")
             return f"搜索出錯: {str(e)}"
 
-    # 註冊天氣查詢功能
-    @llm.register_function(description="取得指定位置的天氣資訊")
-    async def get_weather(location: str) -> Dict[str, Any]:
-        return await get_weather_by_location(location)
+    # 檢查函數是否成功註冊
+    config = llm.get_config()
+    # 檢查是否啟用 Google Search
+    has_google_search = any(
+        "google_search" in tool or "google_search_retrieval" in tool
+        for tool in config.get("tools", [])
+    )
 
-    logger.info(f"✅ 自訂 Agent 已建立（RAG + 天氣查詢啟用）")
+    if 'tools' in config and config['tools']:
+        # 提取函數名稱（如果有的話）
+        func_names = []
+        for tool in config['tools']:
+            if 'function_declarations' in tool:
+                func_names.extend([f['name'] for f in tool['function_declarations']])
+
+        logger.info(f"✅ 自訂 Agent 已建立（RAG + Google Search 啟用）")
+        logger.info(f"📋 已註冊的函數: {func_names}")
+        if has_google_search:
+            logger.info(f"🔍 Google Search 工具: 已啟用")
+    else:
+        logger.warning(f"⚠️  警告：沒有檢測到已註冊的函數或工具！")
 
     return agent
