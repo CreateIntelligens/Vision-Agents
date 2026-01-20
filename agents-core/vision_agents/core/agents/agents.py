@@ -1388,8 +1388,10 @@ class Agent:
         # Variables are now initialized in __init__
 
         if self.publish_audio:
-            framerate = 48000
-            stereo = True
+            # Use 24kHz to match Gemini Realtime's output
+            # Gemini outputs 24kHz PCM, so we need to match it
+            framerate = 24000
+            stereo = False  # Gemini outputs mono
             self._audio_track = self.edge.create_audio_track(
                 framerate=framerate, stereo=stereo
             )
