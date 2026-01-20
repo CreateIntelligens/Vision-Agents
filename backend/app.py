@@ -6,32 +6,33 @@ Vision Agent Backend API
 import os
 import asyncio
 import logging
+import warnings
 from uuid import uuid4
 from urllib.parse import urlencode
 from typing import Dict, Any, Optional
 
 from dotenv import load_dotenv
+
+# 隱藏 Stream SDK 的 dataclass warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="dataclasses_json")
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from getstream import Stream
 import threading
 
-from vision_agents.core import Agent, User
-from vision_agents.core.utils.examples import get_weather_by_location
-from vision_agents.plugins import gemini, openai, getstream
+from vision_agents.core import User
+from backend.agents import AGENT_TYPES
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 降低 httpx 的日誌等級，避免洗版
+# 降低第三方庫的日誌等級
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# 降低 WebRTC 視訊解碼錯誤的日誌等級（網路不穩定時會有損壞的 frame）
 logging.getLogger("aiortc.codecs.vpx").setLevel(logging.ERROR)
 logging.getLogger("libav.libvpx").setLevel(logging.CRITICAL)
-
-load_dotenv()
 
 app = FastAPI(title="Vision Agent API")
 
@@ -44,8 +45,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 儲存多個運行中的 agents (key: call_id)
+# 全域狀態
 active_agents: Dict[str, Dict[str, Any]] = {}
+_prometheus_initialized = False
 YOLO_POSE_MODEL_NAME = "yolo11n-pose.pt"
 
 
@@ -60,8 +62,30 @@ def prefetch_golf_pose_model() -> None:
 
 @app.on_event("startup")
 async def startup_prefetch_models():
-    thread = threading.Thread(target=prefetch_golf_pose_model, daemon=True)
-    thread.start()
+    """啟動時初始化可選功能（優雅降級）"""
+    global _prometheus_initialized
+
+    # 嘗試啟動 Prometheus（可選）
+    if not _prometheus_initialized:
+        try:
+            from opentelemetry import metrics
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.exporter.prometheus import PrometheusMetricReader
+
+            # 不使用獨立的 HTTP server，改用 FastAPI endpoint
+            reader = PrometheusMetricReader()
+            provider = MeterProvider(metric_readers=[reader])
+            metrics.set_meter_provider(provider)
+
+            _prometheus_initialized = True
+            logger.info("📊 Prometheus metrics enabled at /metrics")
+        except ImportError:
+            logger.info("ℹ️  Prometheus metrics disabled (install: pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-prometheus prometheus-client)")
+        except Exception as e:
+            logger.warning(f"⚠️ Prometheus startup failed: {e}")
+
+    # 預載 YOLO 模型（背景執行）
+    threading.Thread(target=prefetch_golf_pose_model, daemon=True).start()
 
 
 # Request/Response Models
@@ -89,15 +113,11 @@ class StopResponse(BaseModel):
 
 
 def get_demo_url(call_id: str, user_name: str = "Human User") -> str:
-    """產生 Stream Demo URL - 每個 call 使用唯一的 user_id"""
+    """產生 Stream Demo URL"""
     api_key = os.getenv("STREAM_API_KEY")
-    api_secret = os.getenv("STREAM_API_SECRET")
+    client = Stream(api_key=api_key, api_secret=os.getenv("STREAM_API_SECRET"))
 
-    client = Stream(api_key=api_key, api_secret=api_secret)
-
-    # 使用 call_id 產生唯一的 human_id
     human_id = f"user-{call_id}"
-    human_name = user_name  # 使用前端傳來的名稱
     token = client.create_token(human_id, expiration=3600)
 
     base_url = f"{os.getenv('EXAMPLE_BASE_URL', 'https://getstream.io/video/demos')}/join/"
@@ -105,7 +125,7 @@ def get_demo_url(call_id: str, user_name: str = "Human User") -> str:
         "api_key": api_key,
         "token": token,
         "skip_lobby": "true",
-        "user_name": human_name,
+        "user_name": user_name,
         "video_encoder": "h264",
         "bitrate": 12000000,
         "w": 1920,
@@ -121,10 +141,10 @@ async def run_agent_in_background(call_id: str, model: str, example: str, user_n
     global active_agents
 
     # 根據 example 類型載入不同的 agent
-    if example == "custom":
-        # 使用我們自訂的 Agent
-        from backend.agents.custom import create_agent
-        logger.info(f"🤖 Using Custom Agent (Gemini Realtime)")
+    if example in AGENT_TYPES:
+        # 使用 backend/agents 中定義的 agent
+        create_agent = AGENT_TYPES[example]
+        logger.info(f"🤖 Loading Agent: {example}")
         agent = await create_agent(call_id, user_name)
 
     elif example == "simple":
@@ -146,10 +166,9 @@ async def run_agent_in_background(call_id: str, model: str, example: str, user_n
         agent = await create_golf_agent()
 
     else:
-        # 其他 examples 暫時使用 custom
-        logger.warning(f"⚠️  Example '{example}' not implemented yet, using custom")
-        from backend.agents.custom import create_agent
-        agent = await create_agent(call_id, user_name)
+        # 其他 examples 使用 custom
+        logger.warning(f"⚠️  Example '{example}' not implemented, using custom")
+        agent = await AGENT_TYPES["custom"](call_id, user_name)
 
     # 創建 human user（在 join 之前）- 每個 call 使用唯一的 human_id
     human_id = f"user-{call_id}"
@@ -162,12 +181,10 @@ async def run_agent_in_background(call_id: str, model: str, example: str, user_n
 
     # 預先創建 messaging channel 並加入 human user 作為 member
     try:
-        api_key = os.getenv("STREAM_API_KEY")
-        api_secret = os.getenv("STREAM_API_SECRET")
-        from getstream import Stream
-        stream_client = Stream(api_key=api_key, api_secret=api_secret)
-
-        # 用 server-side 權限創建 channel，加入 agent 和 human user 作為 members
+        stream_client = Stream(
+            api_key=os.getenv("STREAM_API_KEY"),
+            api_secret=os.getenv("STREAM_API_SECRET")
+        )
         stream_client.chat.get_or_create_channel(
             type="messaging",
             id=call_id,
@@ -207,6 +224,74 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint (原始格式)"""
+    try:
+        from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+        from fastapi.responses import Response
+
+        metrics_data = generate_latest()
+        return Response(content=metrics_data, media_type=CONTENT_TYPE_LATEST)
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="Prometheus client not installed"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate metrics: {str(e)}"
+        )
+
+
+@app.get("/api/metrics/json")
+async def metrics_json():
+    """返回解析後的 metrics JSON（供前端使用）"""
+    try:
+        from prometheus_client import generate_latest, REGISTRY
+
+        # 收集所有 metrics
+        metrics_dict = {}
+
+        for collector in REGISTRY._collector_to_names.keys():
+            for metric in collector.collect():
+                metric_name = metric.name
+
+                # 跳過內建的 process/python metrics
+                if metric_name.startswith(('process_', 'python_', 'target_info')):
+                    continue
+
+                # 收集 samples
+                samples = []
+                for sample in metric.samples:
+                    sample_dict = {
+                        "name": sample.name,
+                        "labels": sample.labels,
+                        "value": sample.value
+                    }
+                    samples.append(sample_dict)
+
+                if samples:
+                    metrics_dict[metric_name] = {
+                        "type": metric.type,
+                        "documentation": metric.documentation,
+                        "samples": samples
+                    }
+
+        return metrics_dict
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="Prometheus client not installed"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate metrics: {str(e)}"
+        )
+
+
 @app.post("/api/start", response_model=StartAgentResponse)
 async def start(request: StartAgentRequest):
     """啟動 Agent - 每次啟動都創建新的 Agent 實例"""
@@ -214,7 +299,7 @@ async def start(request: StartAgentRequest):
         model = request.model
         example = request.example
         user_name = request.user_name
-        supported_examples = {"custom", "simple", "golf"}
+        supported_examples = {"custom", "security_camera", "prometheus_metrics", "simple", "golf"}
 
         if example not in supported_examples:
             raise HTTPException(
