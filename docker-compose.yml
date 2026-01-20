@@ -1,0 +1,175 @@
+services:
+  # ============================================
+  # Nginx Reverse Proxy (HTTPS)
+  # ============================================
+  nginx:
+    image: nginx:alpine
+    container_name: vision-agent-nginx
+
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+
+    ports:
+      - "8910:443"
+
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+
+  # ============================================
+  # Backend API (FastAPI)
+  # ============================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vision-agents:latest
+    container_name: vision-agent-backend
+
+    env_file:
+      - .env
+
+    environment:
+      - BACKEND_PORT=${BACKEND_PORT:-8910}
+
+    volumes:
+      - .:/app
+      - venv-cache:/app/.venv
+
+    # 不需要對外 port，只透過 nginx 訪問
+    expose:
+      - "8910"
+
+    working_dir: /app
+
+    command: >
+      bash -c "
+        uv sync --frozen &&
+        uv pip install fastapi uvicorn[standard] python-dotenv getstream pydantic &&
+        uv pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-prometheus prometheus-client &&
+        cd backend && python app.py
+      "
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8910/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ============================================
+  # Frontend (React + Vite)
+  # ============================================
+  frontend:
+    image: node:20-alpine
+    container_name: vision-agent-frontend
+
+    working_dir: /app
+
+    volumes:
+      - ./web-ui:/app
+
+    # 不需要對外 port，只透過 nginx 訪問
+    expose:
+      - "3001"
+
+    command: >
+      sh -c "
+        npm install &&
+        npm run dev -- --host
+      "
+
+    depends_on:
+      - backend
+
+  # ============================================
+  # Vision Agent - 開發/運行環境
+  # ============================================
+  vision-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vision-agents:latest
+    container_name: vision-agent
+    profiles:
+      - dev
+
+    env_file:
+      - .env
+
+    volumes:
+      - .:/app
+      - venv-cache:/app/.venv
+
+    stdin_open: true
+    tty: true
+
+    working_dir: /app
+
+    command: >
+      bash -c "
+        uv sync --frozen &&
+        exec bash
+      "
+
+  # ============================================
+  # 運行 Simple Agent 範例
+  # ============================================
+  simple-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vision-agents:latest
+    container_name: simple-agent
+    profiles:
+      - examples
+
+    env_file:
+      - .env
+
+    volumes:
+      - .:/app
+      - venv-cache:/app/.venv
+
+    working_dir: /app
+
+    # 使用 --no-demo 因為容器內無法開啟瀏覽器
+    # 執行後會印出 URL，手動在主機瀏覽器開啟
+    command: >
+      bash -c "
+        uv sync --frozen &&
+        cd examples/01_simple_agent_example &&
+        python simple_agent_example.py --no-demo
+      "
+
+  # ============================================
+  # 運行測試
+  # ============================================
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vision-agents:latest
+    container_name: vision-agent-test
+    profiles:
+      - test
+
+    env_file:
+      - .env
+
+    volumes:
+      - .:/app
+      - venv-cache:/app/.venv
+
+    command: >
+      bash -c "
+        uv sync --frozen &&
+        pytest -m 'not integration'
+      "
+
+volumes:
+  venv-cache:
+    name: vision-agents-venv

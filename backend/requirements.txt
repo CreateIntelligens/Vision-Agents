@@ -1,0 +1,21 @@
+# Core dependencies (required)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-dotenv>=1.0.0
+getstream>=1.0.0
+pydantic>=2.0.0
+
+# Optional: Security Camera advanced features
+# Install with: pip install face-recognition opencv-python ultralytics tweepy Pillow
+# Note: face-recognition requires dlib (needs CMake and C++ compiler)
+# face-recognition>=1.3.0
+# opencv-python>=4.8.0
+# ultralytics>=8.0.0
+# tweepy>=4.14.0
+# Pillow>=10.0.0
+
+# Optional: Prometheus Metrics monitoring
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-prometheus>=0.41b0
+prometheus-client>=0.18.0

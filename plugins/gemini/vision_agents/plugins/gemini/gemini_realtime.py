@@ -40,7 +40,7 @@ from vision_agents.core.llm.llm import LLMResponseEvent
 from vision_agents.core.llm.llm_types import ToolSchema
 from vision_agents.core.processors import Processor
 from vision_agents.core.utils.video_forwarder import VideoForwarder
-from vision_agents.core.utils.video_utils import frame_to_png_bytes
+from vision_agents.core.utils.video_utils import frame_to_jpeg_bytes
 
 from .file_search import FileSearchStore
 
@@ -60,12 +60,12 @@ DEFAULT_CONFIG = LiveConnectConfigDict(
         language_code="en-US",
     ),
     realtime_input_config=RealtimeInputConfigDict(
-        turn_coverage=TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY
+        turn_coverage=TurnCoverage.TURN_INCLUDES_ALL_INPUT  # 包含所有視訊幀，不只是說話時的
     ),
     enable_affective_dialog=False,
     context_window_compression=ContextWindowCompressionConfigDict(
-        trigger_tokens=25600,
-        sliding_window=SlidingWindowDict(target_tokens=12800),
+        trigger_tokens=40000,  # 提高觸發壓縮的門檻
+        sliding_window=SlidingWindowDict(target_tokens=20000),  # 壓縮後保留更多內容
     ),
 )
 
@@ -125,6 +125,8 @@ class GeminiRealtime(realtime.Realtime):
         client: Optional[genai.Client] = None,
         api_key: Optional[str] = None,
         file_search_store: Optional[FileSearchStore] = None,
+        enable_google_search: bool = False,
+        fps: int = 1,
         **kwargs,
     ) -> None:
         """
@@ -138,12 +140,15 @@ class GeminiRealtime(realtime.Realtime):
             api_key: Optional API key.
             file_search_store: Optional FileSearchStore for RAG functionality.
                 See: https://ai.google.dev/gemini-api/docs/file-search
+            enable_google_search: Enable built-in Google Search tool.
+            fps: Frames per second for video input (default: 1).
             **kwargs: Additional arguments passed to parent class.
         """
-        super().__init__(**kwargs)
+        super().__init__(fps=fps, **kwargs)
         self.model = model
         self.connected: bool = False
         self.file_search_store = file_search_store
+        self.enable_google_search = enable_google_search
 
         http_options = http_options or HttpOptions(api_version="v1alpha")
 
@@ -165,6 +170,7 @@ class GeminiRealtime(realtime.Realtime):
         self._processing_task: Optional[asyncio.Task] = None
         self._exit_stack = contextlib.AsyncExitStack()
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._is_sending_frame = False
 
     @property
     def _session(self):
@@ -250,8 +256,9 @@ class GeminiRealtime(realtime.Realtime):
         )
 
         # Add frame handler (starts automatically)
-        self._video_forwarder.add_frame_handler(self._send_video_frame)
-        logger.info(f"Started video forwarding with {self.fps} FPS")
+        # Explicitly set FPS to ensure we don't overload Gemini even if the forwarder has high FPS
+        self._video_forwarder.add_frame_handler(self._send_video_frame, fps=self.fps)
+        logger.info(f"🎬 Started video forwarding: self.fps={self.fps}, forwarder.fps={self._video_forwarder.fps}, shared={shared_forwarder is not None}")
 
     async def _send_video_frame(self, frame: av.VideoFrame) -> None:
         """
@@ -260,18 +267,35 @@ class GeminiRealtime(realtime.Realtime):
         Parameters:
             frame: Video frame to send.
         """
-        loop = asyncio.get_running_loop()
+        # Avoid queue buildup by dropping frames if the previous one is still sending
+        if self._is_sending_frame:
+            return
 
-        # Run frame conversion in a separate thread to avoid blocking the loop.
-        png_bytes = await loop.run_in_executor(
-            self._executor, frame_to_png_bytes, frame
-        )
-
-        blob = Blob(data=png_bytes, mime_type="image/png")
+        self._is_sending_frame = True
         try:
+            loop = asyncio.get_running_loop()
+
+            # Run frame conversion in a separate thread to avoid blocking the loop.
+            # Use JPEG with quality=60 to reduce memory usage (PNG was causing 1GB limit errors)
+            jpeg_bytes = await loop.run_in_executor(
+                self._executor,
+                lambda: frame_to_jpeg_bytes(frame, target_width=1280, target_height=720, quality=60)
+            )
+
+            blob = Blob(data=jpeg_bytes, mime_type="image/jpeg")
+            
+            import time
             await self._session.send_realtime_input(media=blob)
-        except Exception:
-            logger.exception("Failed to send a video frame to Gemini Live API")
+            self._frame_count = getattr(self, '_frame_count', 0) + 1
+            # 每 10 幀輸出一次日誌，避免洗版
+            if self._frame_count % 10 == 0:
+                current_time = time.strftime("%H:%M:%S")
+                logger.info(f"📹 [{current_time}] 已發送 {self._frame_count} 幀視訊到 Gemini（JPEG {len(jpeg_bytes)//1024}KB）")
+        except Exception as e:
+            # 只記錄警告，不印完整 traceback（連線斷開時會大量觸發）
+            logger.warning(f"Failed to send video frame to Gemini: {type(e).__name__}")
+        finally:
+            self._is_sending_frame = False
 
     async def stop_watching_video_track(self) -> None:
         if self._video_forwarder is not None:
@@ -356,6 +380,12 @@ class GeminiRealtime(realtime.Realtime):
             file_search_config = self.file_search_store.get_tool_config()
             tools.append(file_search_config)
             logger.info("Adding file search tool to Gemini Live config")
+
+        # Add Google Search tool if enabled
+        if self.enable_google_search:
+            # Add Google Search as a separate tool
+            tools.append({"google_search_retrieval": {}})
+            logger.info("Adding Google Search tool to Gemini Live config")
 
         if tools:
             config["tools"] = tools  # type: ignore[typeddict-item]
