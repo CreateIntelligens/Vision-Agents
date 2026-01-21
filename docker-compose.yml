@@ -47,9 +47,11 @@ services:
 
     command: >
       bash -c "
+        apt-get update && apt-get install -y cmake build-essential &&
         uv sync --frozen &&
         uv pip install fastapi uvicorn[standard] python-dotenv getstream pydantic &&
         uv pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-prometheus prometheus-client &&
+        uv pip install face-recognition opencv-python ultralytics tweepy Pillow aiofiles &&
         cd backend && python app.py
       "
 

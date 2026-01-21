@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from getstream import Stream
+from getstream.models import UserRequest
 import threading
 
 from vision_agents.core import User
@@ -185,6 +186,13 @@ async def run_agent_in_background(call_id: str, model: str, example: str, user_n
             api_key=os.getenv("STREAM_API_KEY"),
             api_secret=os.getenv("STREAM_API_SECRET")
         )
+
+        # 更新 Stream Chat 用戶名稱 (不設定 role 避免權限問題)
+        stream_client.upsert_users(
+            UserRequest(id=human_id, name=user_name)
+        )
+        logger.info(f"✅ Updated Stream Chat user: {human_id} with name: {user_name}")
+
         stream_client.chat.get_or_create_channel(
             type="messaging",
             id=call_id,
