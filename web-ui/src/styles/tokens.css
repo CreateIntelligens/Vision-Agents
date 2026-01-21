@@ -1,0 +1,42 @@
+/* ============================================
+   TECH-NOIR CONTROL CONSOLE
+   IBM Plex Mono + Orbitron | Dark Cyberpunk
+   ============================================ */
+
+/* Font Imports */
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syncopate:wght@400;700&display=swap');
+
+/* CSS Variables */
+:root {
+  /* Colors - Cyber-Noir Pro Max */
+  --color-void: #02040a;
+  --color-deep: #080b14;
+  --color-slate: #121726;
+  --color-cyan: #00f2ff;
+  --color-cyan-glow: rgba(0, 242, 255, 0.4);
+  --color-teal: #00ffc8;
+  --color-purple: #c300ff;
+  --color-red: #ff004c;
+  --color-gold: #ffbd00;
+  --color-text: #f0f4ff;
+  --color-text-dim: #8892b0;
+  --color-border: rgba(0, 242, 255, 0.15);
+  --color-glass: rgba(8, 11, 20, 0.7);
+
+  /* Fonts */
+  --font-mono: 'Space Mono', monospace;
+  --font-display: 'Syncopate', sans-serif;
+
+  /* Spacing */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+
+  /* Effects */
+  --glass-blur: blur(20px);
+  --glow-cyan: 0 0 30px var(--color-cyan-glow);
+  --border-gradient: linear-gradient(135deg, var(--color-cyan), transparent 50%, var(--color-purple));
+}

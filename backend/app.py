@@ -3,6 +3,22 @@
 Vision Agent Backend API
 提供 RESTful API 來控制 Agent
 """
+# =============================================================================
+# IMPORTANT: Configure OpenTelemetry BEFORE importing vision_agents
+# =============================================================================
+from opentelemetry import metrics
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.sdk.metrics import MeterProvider
+from prometheus_client import REGISTRY, generate_latest
+
+# Configure OpenTelemetry to export to Prometheus
+reader = PrometheusMetricReader()
+provider = MeterProvider(metric_readers=[reader])
+metrics.set_meter_provider(provider)
+
+# =============================================================================
+# Now import other modules
+# =============================================================================
 import os
 import asyncio
 import logging
@@ -234,8 +250,8 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/metrics")
-async def metrics():
+@app.get("/api/metrics/prometheus")
+async def metrics_prometheus():
     """Prometheus metrics endpoint (原始格式)"""
     try:
         from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -248,54 +264,38 @@ async def metrics():
             status_code=503,
             detail="Prometheus client not installed"
         )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate metrics: {str(e)}"
-        )
 
 
 @app.get("/api/metrics/json")
 async def metrics_json():
-    """返回解析後的 metrics JSON（供前端使用）"""
+    """Prometheus metrics in JSON format for frontend"""
     try:
-        from prometheus_client import generate_latest, REGISTRY
-
-        # 收集所有 metrics
-        metrics_dict = {}
-
-        for collector in REGISTRY._collector_to_names.keys():
-            for metric in collector.collect():
-                metric_name = metric.name
-
-                # 跳過內建的 process/python metrics
-                if metric_name.startswith(('process_', 'python_', 'target_info')):
-                    continue
-
-                # 收集 samples
-                samples = []
-                for sample in metric.samples:
-                    sample_dict = {
-                        "name": sample.name,
-                        "labels": sample.labels,
-                        "value": sample.value
-                    }
-                    samples.append(sample_dict)
-
-                if samples:
-                    metrics_dict[metric_name] = {
-                        "type": metric.type,
-                        "documentation": metric.documentation,
-                        "samples": samples
-                    }
-
-        return metrics_dict
-    except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="Prometheus client not installed"
-        )
+        from prometheus_client import REGISTRY
+        from prometheus_client.parser import text_string_to_metric_families
+        
+        # Get metrics in Prometheus text format
+        metrics_text = generate_latest(REGISTRY).decode('utf-8')
+        
+        # Parse into structured format
+        result = {}
+        for family in text_string_to_metric_families(metrics_text):
+            metric_name = family.name
+            result[metric_name] = {
+                'type': family.type,
+                'help': family.documentation,
+                'samples': []
+            }
+            
+            for sample in family.samples:
+                result[metric_name]['samples'].append({
+                    'name': sample.name,
+                    'labels': sample.labels,
+                    'value': sample.value
+                })
+        
+        return result
     except Exception as e:
+        logger.error(f"Failed to generate metrics JSON: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate metrics: {str(e)}"

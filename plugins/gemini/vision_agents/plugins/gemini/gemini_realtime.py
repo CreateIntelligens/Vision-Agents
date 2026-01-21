@@ -77,6 +77,7 @@ def _should_reconnect(exc: Exception) -> bool:
     """
     # Gemini WS API returns code 1011 on session timeout
     reconnect_close_codes = [
+        1008,  # Policy violation (sometimes transient)
         1011,  # Server-side exception or session timeout
         1012,  # Service restart
         1013,  # Try again later

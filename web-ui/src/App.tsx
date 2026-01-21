@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
+import { motion, AnimatePresence, MotionConfig } from 'framer-motion'
 import {
   Video, Loader2, Power, PowerOff, Bot, User,
   Camera, BarChart3, Zap, Shield, Activity, ChevronRight,
@@ -144,7 +144,7 @@ function App() {
       const data = await res.json()
 
       if (data.success) {
-        window.open(data.demo_url, '_blank')
+        window.open(data.demo_url, '_blank', 'noopener,noreferrer')
         setDemoUrl(data.demo_url)
         setStatus({
           running: true,
@@ -177,69 +177,76 @@ function App() {
   }
 
   const openDemo = () => {
-    if (demoUrl) window.open(demoUrl, '_blank')
+    if (demoUrl) window.open(demoUrl, '_blank', 'noopener,noreferrer')
+  }
+
+  const openMetrics = () => {
+    window.open('/metrics', '_blank', 'noopener,noreferrer')
   }
 
   const selectedConfig = AGENT_CONFIGS.find(c => c.id === selectedMode)!
 
   return (
-    <div className="tech-noir-container">
-      {/* Animated background */}
-      <div className="bg-grid" />
-      <div className="bg-gradient" />
-      <div className="scanlines" />
-      
-      {/* Data stream effect */}
-      <div className="data-stream">
-        {Array.from({ length: 20 }).map((_, i) => (
-          <div key={i} className="data-bit" style={{ left: `${i * 5}%`, animationDelay: `${i * 0.3}s` }}>
-            {Math.random() > 0.5 ? '1' : '0'}
-          </div>
-        ))}
-      </div>
+    <MotionConfig reducedMotion="never">
+      <div className="tech-noir-container">
+        {/* Animated background */}
+        <div className="bg-grid" aria-hidden="true" />
+        <div className="bg-gradient" aria-hidden="true" />
+        <div className="scanlines" aria-hidden="true" />
+        
+        {/* Data stream effect */}
+        <div className="data-stream" aria-hidden="true">
+          {Array.from({ length: 20 }).map((_, i) => (
+            <div key={i} className="data-bit" style={{ left: `${i * 5}%`, animationDelay: `${i * 0.3}s` }}>
+              {Math.random() > 0.5 ? '1' : '0'}
+            </div>
+          ))}
+        </div>
 
-      <div className="content-container">
-        {/* Header */}
-        <motion.header
-          className="system-header"
-          initial={{ y: -50, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          transition={{ duration: 0.8, ease: [0.6, 0.05, 0.01, 0.9] }}
-        >
-          <div className="header-main">
-            <div className="logo-block">
-              <Terminal className="logo-icon" />
-              <div className="logo-text-group">
-                <h1 className="logo-title">VISION AGENTS</h1>
-                <p className="logo-subtitle">CLASSIFIED SYSTEM ACCESS</p>
+        <div className="content-container">
+          {/* Header */}
+          <motion.header
+            className="system-header"
+            initial={{ y: -50, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ duration: 0.8, ease: [0.6, 0.05, 0.01, 0.9] }}
+          >
+            <div className="header-main">
+              <div className="logo-block">
+                <Terminal className="logo-icon" />
+                <div className="logo-text-group">
+                  <h1 className="logo-title">VISION AGENTS</h1>
+                  <p className="logo-subtitle">CLASSIFIED SYSTEM ACCESS</p>
+                </div>
+              </div>
+
+              <div className="system-info">
+                <div className="info-item">
+                  <span className="info-label">SYSTEM TIME</span>
+                  <span className="info-value">{systemTime.toLocaleTimeString('en-US', { hour12: false })}</span>
+                </div>
+                <div className="info-item">
+                  <span className="info-label">STATUS</span>
+                  <motion.div 
+                    className={`status-indicator ${status.running ? 'active' : 'standby'}`}
+                    animate={{ opacity: status.running ? [1, 0.5, 1] : 1 }}
+                    transition={{ repeat: status.running ? Infinity : 0, duration: 2 }}
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <Activity size={14} />
+                    <span>{status.running ? 'ACTIVE' : 'STANDBY'}</span>
+                  </motion.div>
+                </div>
               </div>
             </div>
 
-            <div className="system-info">
-              <div className="info-item">
-                <span className="info-label">SYSTEM TIME</span>
-                <span className="info-value">{systemTime.toLocaleTimeString('en-US', { hour12: false })}</span>
-              </div>
-              <div className="info-item">
-                <span className="info-label">STATUS</span>
-                <motion.div 
-                  className={`status-indicator ${status.running ? 'active' : 'standby'}`}
-                  animate={{ opacity: status.running ? [1, 0.5, 1] : 1 }}
-                  transition={{ repeat: status.running ? Infinity : 0, duration: 2 }}
-                >
-                  <Activity size={14} />
-                  <span>{status.running ? 'ACTIVE' : 'STANDBY'}</span>
-                </motion.div>
-              </div>
+            <div className="security-bar">
+              <Lock size={12} />
+              <span>SECURITY CLEARANCE: LEVEL 5</span>
+              <div className="bar-fill" />
             </div>
-          </div>
-
-          <div className="security-bar">
-            <Lock size={12} />
-            <span>SECURITY CLEARANCE: LEVEL 5</span>
-            <div className="bar-fill" />
-          </div>
-        </motion.header>
+          </motion.header>
 
         <AnimatePresence mode="wait">
           {!status.running ? (
@@ -268,6 +275,7 @@ function App() {
                   {AGENT_CONFIGS.map((config, index) => (
                     <motion.button
                       key={config.id}
+                      type="button"
                       className={`agent-card ${selectedMode === config.id ? 'selected' : ''}`}
                       onClick={() => setSelectedMode(config.id)}
                       disabled={loading}
@@ -331,11 +339,12 @@ function App() {
                   </div>
 
                   <div className="credential-input">
-                    <label className="input-label">
+                    <label className="input-label" htmlFor="operator-id">
                       <User size={14} />
                       <span>OPERATOR ID</span>
                     </label>
                     <motion.input
+                      id="operator-id"
                       type="text"
                       className={`cyber-input ${nameError ? 'error' : ''}`}
                       placeholder="選填，留空則隨機生成..."
@@ -354,6 +363,8 @@ function App() {
                         className="input-error"
                         initial={{ opacity: 0, height: 0 }}
                         animate={{ opacity: 1, height: 'auto' }}
+                        role="status"
+                        aria-live="polite"
                       >
                         <AlertCircle size={12} />
                         {nameError}
@@ -365,6 +376,8 @@ function App() {
                         className="input-success"
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
+                        role="status"
+                        aria-live="polite"
                       >
                         <CheckCircle2 size={12} />
                         CREDENTIALS VERIFIED
@@ -391,6 +404,7 @@ function App() {
 
                   <motion.button
                     className="launch-btn"
+                    type="button"
                     onClick={startAgent}
                     disabled={loading || !!nameError}
                     whileHover={{ scale: 1.02 }}
@@ -410,6 +424,21 @@ function App() {
                       </>
                     )}
                   </motion.button>
+
+                  {selectedMode === 'prometheus_metrics' && (
+                    <motion.button
+                      className="launch-btn secondary"
+                      type="button"
+                      onClick={openMetrics}
+                      disabled={loading}
+                      whileHover={{ scale: 1.02 }}
+                      whileTap={{ scale: 0.98 }}
+                      style={{ color: selectedConfig.color, borderColor: selectedConfig.color }}
+                    >
+                      <BarChart3 size={18} />
+                      OPEN METRICS DASHBOARD
+                    </motion.button>
+                  )}
                 </div>
               </motion.section>
             </motion.main>
@@ -457,6 +486,7 @@ function App() {
                           src={demoUrl}
                           className="video-iframe"
                           allow="camera; microphone; fullscreen; display-capture"
+                          title="AI voice call"
                         />
                       )}
                       <div className="video-footer">
@@ -477,6 +507,7 @@ function App() {
                     <div className="split-actions">
                       <motion.button
                         className="session-btn danger"
+                        type="button"
                         onClick={stopAgent}
                         whileHover={{ scale: 1.05 }}
                         whileTap={{ scale: 0.95 }}
@@ -490,6 +521,7 @@ function App() {
                   <div className="session-actions">
                     <motion.button
                       className="session-btn primary"
+                      type="button"
                       onClick={openDemo}
                       whileHover={{ scale: 1.05 }}
                       whileTap={{ scale: 0.95 }}
@@ -500,6 +532,7 @@ function App() {
 
                     <motion.button
                       className="session-btn danger"
+                      type="button"
                       onClick={stopAgent}
                       whileHover={{ scale: 1.05 }}
                       whileTap={{ scale: 0.95 }}
@@ -524,12 +557,13 @@ function App() {
           <Unlock size={12} />
           <span>AUTHORIZED PERSONNEL ONLY</span>
           <span className="separator">|</span>
-          <span>GEMINI 2.5 FLASH REALTIME</span>
+          <span>REALTIME AI</span>
           <span className="separator">|</span>
           <span>SYSTEM BUILD 2026.01</span>
         </motion.footer>
+        </div>
       </div>
-    </div>
+    </MotionConfig>
   )
 }
 

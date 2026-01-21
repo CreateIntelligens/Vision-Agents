@@ -32,6 +32,10 @@ _pending_theft_tasks: Dict[str, asyncio.Task] = {}
 # Track package history
 _package_history: Dict[str, Dict[str, Any]] = {}
 
+# Track last greeting time for each face (avoid spam)
+_last_greeting_time: Dict[str, float] = {}
+GREETING_COOLDOWN_SECONDS = 60.0  # 同一個人 60 秒內只歡迎一次
+
 
 async def handle_package_theft(
     agent: Agent,
@@ -216,18 +220,32 @@ async def create_agent(call_id: str, user_name: str = "Human User") -> Agent:
     # Subscribe to person detected event
     @agent.events.subscribe
     async def on_person_detected(event: PersonDetectedEvent):
+        import time
+        current_time = time.time()
+        
         if event.is_new:
             agent.logger.info(f"🚨 新訪客警報: {event.face_id} 偵測到！")
-        else:
-            agent.logger.info(f"👤 訪客回訪: {event.face_id} (已見 {event.detection_count} 次)")
-            # Greet returning visitors - use registered name if available
+            # Greet new visitors
             if hasattr(event, 'name') and event.name:
                 display_name = event.name
             else:
-                # For the primary user (first visitor), use user_name
-                display_name = user_name if event.detection_count <= 3 else event.face_id[:8]
-            # 使用 Gemini Realtime 直接說話 (而非 agent.say 需要 TTS)
-            await llm.simple_response(text=f"歡迎回來，{display_name}！")
+                display_name = user_name
+            await llm.simple_response(text=f"{display_name}，歡迎！")
+            _last_greeting_time[event.face_id] = current_time
+        else:
+            # Only greet if cooldown period has passed
+            last_greeting = _last_greeting_time.get(event.face_id, 0)
+            if current_time - last_greeting >= GREETING_COOLDOWN_SECONDS:
+                agent.logger.info(f"👤 訪客回訪: {event.face_id} (已見 {event.detection_count} 次)")
+                if hasattr(event, 'name') and event.name:
+                    display_name = event.name
+                else:
+                    display_name = user_name
+                await llm.simple_response(text=f"{display_name}，歡迎回來！")
+                _last_greeting_time[event.face_id] = current_time
+            else:
+                # Silent detection (no spam)
+                agent.logger.debug(f"👤 訪客偵測: {event.face_id} (冷卻中，不打招呼)")
 
     # Subscribe to person disappeared event
     @agent.events.subscribe

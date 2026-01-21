@@ -5,9 +5,10 @@
 
 FROM python:3.12-slim
 
-# Install system dependencies
+# Install system dependencies (including cmake for face-recognition/dlib)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    cmake \
     git \
     curl \
     ffmpeg \
@@ -23,6 +24,32 @@ RUN groupadd --gid 1000 visionagent \
     && useradd --uid 1000 --gid visionagent --shell /bin/bash --create-home visionagent
 
 WORKDIR /app
+
+# Copy dependency files and required directories (for uv sync)
+COPY pyproject.toml uv.lock ./
+COPY agents-core ./agents-core
+COPY plugins ./plugins
+
+# Install Python dependencies
+RUN uv sync --frozen
+
+# Install additional backend dependencies
+RUN uv pip install \
+    fastapi \
+    uvicorn[standard] \
+    python-dotenv \
+    getstream \
+    pydantic \
+    opentelemetry-api \
+    opentelemetry-sdk \
+    opentelemetry-exporter-prometheus \
+    prometheus-client \
+    face-recognition \
+    opencv-python \
+    ultralytics \
+    tweepy \
+    Pillow \
+    aiofiles
 
 # Set environment variables
 ENV PATH="/app/.venv/bin:$PATH"

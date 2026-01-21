@@ -572,13 +572,19 @@ class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
                 if known_name and not face.name:
                     face.name = known_name
 
-                if face.disappeared_at is not None:
+                # Only emit "return" event if person actually left (event was sent)
+                if face.disappeared_at is not None and face._event_sent:
                     face.detection_count += 1
                     display_name = face.name or matching_id[:8]
                     logger.info(f"Returning: {display_name} (visit #{face.detection_count})")
                     self._emit_person_event(face, is_new=False, current_time=current_time)
-                    face.disappeared_at = None
                     face._event_sent = False
+                elif face.disappeared_at is not None:
+                    # Person was briefly out of frame but didn't actually "leave"
+                    logger.debug(f"Redetected: {face.name or matching_id[:8]} (was briefly occluded)")
+                
+                # Reset disappeared state when person is seen again
+                face.disappeared_at = None
             else:
                 face_id = str(uuid.uuid4())
                 detection = FaceDetection(

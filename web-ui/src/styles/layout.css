@@ -1,0 +1,57 @@
+/* Content Container */
+.content-container {
+  position: relative;
+  z-index: 50;
+  max-width: 1800px;
+  width: 95%;
+  margin: 0 auto;
+  padding: var(--space-lg);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ============================================
+   SETUP GRID
+   ============================================ */
+.setup-grid {
+  display: grid;
+  grid-template-columns: 1fr 420px;
+  gap: var(--space-2xl);
+  flex: 1;
+  align-items: start;
+}
+
+@media (max-width: 1200px) {
+  .setup-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ============================================
+   AGENT GRID
+   ============================================ */
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: auto;
+  gap: var(--space-xl);
+}
+
+@media (max-width: 1400px) {
+  .agent-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .agent-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .content-container {
+    padding: var(--space-md);
+  }
+}

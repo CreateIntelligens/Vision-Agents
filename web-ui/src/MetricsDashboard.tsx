@@ -2,13 +2,13 @@ import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { Activity, Zap, MessageSquare, Clock, TrendingUp, RefreshCw } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import './MetricsDashboard.css'
 
 interface MetricsData {
   timestamp: number
-  llm_latency?: number
-  llm_tokens_input?: number
-  llm_tokens_output?: number
-  realtime_sessions?: number
+  audio_latency?: number      // 音訊輸出延遲
+  ai_transcriptions?: number  // AI 語音輸出次數
+  user_transcriptions?: number // 用戶語音輸入次數
 }
 
 interface MetricsDashboardProps {
@@ -36,25 +36,24 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
           timestamp: now,
         }
 
-        // 提取指標數值
-        if (data.llm_latency_ms?.samples) {
-          const latencySample = data.llm_latency_ms.samples.find((s: any) => s.name.includes('_sum'))
-          const countSample = data.llm_latency_ms.samples.find((s: any) => s.name.includes('_count'))
-          if (latencySample && countSample && countSample.value > 0) {
-            newPoint.llm_latency = latencySample.value / countSample.value
+        // 音訊輸出延遲（histogram，需要計算平均值）
+        const audioLatencyMetric = data.realtime_audio_output_duration_ms_milliseconds
+        if (audioLatencyMetric?.samples) {
+          const sumSample = audioLatencyMetric.samples.find((s: any) => s.name.includes('_sum'))
+          const countSample = audioLatencyMetric.samples.find((s: any) => s.name.includes('_count'))
+          if (sumSample && countSample && countSample.value > 0) {
+            newPoint.audio_latency = sumSample.value / countSample.value
           }
         }
 
-        if (data.llm_tokens_input?.samples?.[0]) {
-          newPoint.llm_tokens_input = data.llm_tokens_input.samples[0].value
+        // AI 語音輸出次數
+        if (data.realtime_transcriptions_agent?.samples?.[0]) {
+          newPoint.ai_transcriptions = data.realtime_transcriptions_agent.samples[0].value
         }
 
-        if (data.llm_tokens_output?.samples?.[0]) {
-          newPoint.llm_tokens_output = data.llm_tokens_output.samples[0].value
-        }
-
-        if (data.realtime_sessions?.samples?.[0]) {
-          newPoint.realtime_sessions = data.realtime_sessions.samples[0].value
+        // 用戶語音輸入次數
+        if (data.realtime_transcriptions_user?.samples?.[0]) {
+          newPoint.user_transcriptions = data.realtime_transcriptions_user.samples[0].value
         }
 
         setHistory(prev => [...prev.slice(-19), newPoint]) // 保留最近 20 個點
@@ -72,13 +71,40 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
   }, [])
 
   const getMetricValue = (metricName: string): string => {
-    if (!metrics || !metrics[metricName]) return 'N/A'
-    const samples = metrics[metricName].samples
+    if (!metrics) return 'N/A'
+
+    // 支持多種指標名稱（實際名稱 -> 別名）
+    const metricMap: Record<string, string[]> = {
+      'llm_tool_latency_ms': ['llm_tool_latency_ms_milliseconds', 'llm_latency_ms'],
+      'llm_tool_calls': ['llm_tool_calls', 'llm_tool_calls_total'],
+      'realtime_transcriptions_agent': ['realtime_transcriptions_agent', 'realtime_transcriptions_agent_total'],
+      'realtime_transcriptions_user': ['realtime_transcriptions_user'],
+      'realtime_audio_output_bytes': ['realtime_audio_output_bytes'],
+      'process_memory_mb': ['process_resident_memory_bytes'],
+    }
+
+    let metricData = metrics[metricName]
+    if (!metricData && metricMap[metricName]) {
+      for (const alt of metricMap[metricName]) {
+        if (metrics[alt]) {
+          metricData = metrics[alt]
+          break
+        }
+      }
+    }
+
+    if (!metricData) return 'N/A'
+    const samples = metricData.samples
     if (!samples || samples.length === 0) return '0'
 
-    // 如果是 counter，返回總數
-    if (metricName.includes('tokens') || metricName.includes('sessions')) {
-      return Math.round(samples[0].value).toString()
+    // 特殊處理：記憶體轉 MB
+    if (metricName === 'process_memory_mb') {
+      return Math.round(samples[0].value / 1024 / 1024).toString()
+    }
+
+    // 特殊處理：音訊轉 MB
+    if (metricName === 'realtime_audio_output_bytes') {
+      return (samples[0].value / 1024 / 1024).toFixed(1)
     }
 
     // 如果是 histogram，計算平均值
@@ -88,7 +114,7 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
       return Math.round(sumSample.value / countSample.value).toString()
     }
 
-    return samples[0].value.toFixed(2)
+    return Math.round(samples[0].value).toString()
   }
 
   if (loading) {
@@ -113,7 +139,7 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
   return (
     <div className="metrics-dashboard">
       <div className="metrics-grid">
-        {/* LLM 延遲 */}
+        {/* AI 語音轉錄 */}
         <motion.div
           className="metric-card"
           initial={{ opacity: 0, y: 20 }}
@@ -121,15 +147,15 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
           transition={{ delay: 0.1 }}
         >
           <div className="metric-header">
-            <Clock size={24} />
-            <h3>LLM 平均延遲</h3>
+            <MessageSquare size={24} />
+            <h3>AI 語音輸出</h3>
           </div>
           <div className="metric-value">
-            {getMetricValue('llm_latency_ms')} <span className="unit">ms</span>
+            {getMetricValue('realtime_transcriptions_agent')} <span className="unit">次</span>
           </div>
         </motion.div>
 
-        {/* Token 輸入 */}
+        {/* 用戶語音轉錄 */}
         <motion.div
           className="metric-card"
           initial={{ opacity: 0, y: 20 }}
@@ -137,15 +163,15 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
           transition={{ delay: 0.2 }}
         >
           <div className="metric-header">
-            <MessageSquare size={24} />
-            <h3>輸入 Tokens</h3>
+            <Activity size={24} />
+            <h3>用戶語音輸入</h3>
           </div>
           <div className="metric-value">
-            {getMetricValue('llm_tokens_input')} <span className="unit">tokens</span>
+            {getMetricValue('realtime_transcriptions_user')} <span className="unit">次</span>
           </div>
         </motion.div>
 
-        {/* Token 輸出 */}
+        {/* 音訊輸出大小 */}
         <motion.div
           className="metric-card"
           initial={{ opacity: 0, y: 20 }}
@@ -154,14 +180,14 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
         >
           <div className="metric-header">
             <Zap size={24} />
-            <h3>輸出 Tokens</h3>
+            <h3>音訊輸出</h3>
           </div>
           <div className="metric-value">
-            {getMetricValue('llm_tokens_output')} <span className="unit">tokens</span>
+            {getMetricValue('realtime_audio_output_bytes')} <span className="unit">MB</span>
           </div>
         </motion.div>
 
-        {/* Realtime Sessions */}
+        {/* 記憶體使用 */}
         <motion.div
           className="metric-card"
           initial={{ opacity: 0, y: 20 }}
@@ -169,11 +195,11 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
           transition={{ delay: 0.4 }}
         >
           <div className="metric-header">
-            <Activity size={24} />
-            <h3>Realtime 連線</h3>
+            <Clock size={24} />
+            <h3>記憶體使用</h3>
           </div>
           <div className="metric-value">
-            {getMetricValue('realtime_sessions')} <span className="unit">sessions</span>
+            {getMetricValue('process_memory_mb')} <span className="unit">MB</span>
           </div>
         </motion.div>
       </div>
@@ -186,7 +212,7 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
           animate={{ opacity: 1 }}
           transition={{ delay: 0.5 }}
         >
-          <h3><TrendingUp size={20} /> 延遲趨勢</h3>
+          <h3><TrendingUp size={20} /> 對話趨勢</h3>
           <ResponsiveContainer width="100%" height={200}>
             <LineChart data={history}>
               <CartesianGrid strokeDasharray="3 3" stroke="#333" />
@@ -203,9 +229,16 @@ export function MetricsDashboard({ callId }: MetricsDashboardProps) {
               <Legend />
               <Line
                 type="monotone"
-                dataKey="llm_latency"
+                dataKey="ai_transcriptions"
                 stroke="#00d9ff"
-                name="LLM 延遲 (ms)"
+                name="AI 語音輸出"
+                dot={false}
+              />
+              <Line
+                type="monotone"
+                dataKey="user_transcriptions"
+                stroke="#ff6b6b"
+                name="用戶語音輸入"
                 dot={false}
               />
             </LineChart>
