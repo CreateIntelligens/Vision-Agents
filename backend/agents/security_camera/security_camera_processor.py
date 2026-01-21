@@ -6,7 +6,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypeVar
 
 import aiortc
 import av
@@ -27,11 +27,29 @@ logger = logging.getLogger(__name__)
 OVERLAY_WIDTH = 200
 GRID_COLS = 2
 MAX_THUMBNAILS = 12
-PICKUP_THRESHOLD_SECONDS = (
-    5.0  # Reduced for faster demo cleanup (poster fires immediately anyway)
-)
+PICKUP_THRESHOLD_SECONDS = 5.0
 PICKUP_MAX_AGE_SECONDS = 300.0
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Colors (BGR format)
+COLOR_GREEN = (0, 255, 0)
+COLOR_BLUE = (255, 150, 150)
+COLOR_WHITE = (255, 255, 255)
+COLOR_GRAY = (200, 200, 200)
+COLOR_BLACK = (0, 0, 0)
+COLOR_DARK_GRAY = (40, 40, 40)
+
+# Font settings
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SMALL = 0.3
+FONT_MEDIUM = 0.4
+FONT_LARGE = 0.5
+
+# Detection classes for YOLO
+PACKAGE_DETECT_CLASSES = [
+    "Box", "Box_broken", "Open_package", "Package",  # Custom model
+    "suitcase", "backpack", "handbag", "bottle", "book",  # COCO pretrained
+]
 
 
 @dataclass
@@ -68,7 +86,6 @@ class PackageDisappearedEvent(PluginBaseEvent):
     confidence: float = 0.0
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
-    # Picker info (who was present when the package disappeared)
     picker_face_id: Optional[str] = None
     picker_name: Optional[str] = None
 
@@ -95,8 +112,9 @@ class FaceDetection:
     last_seen: float
     bbox: tuple
     detection_count: int = 1
-    name: Optional[str] = None  # Name if this is a known face
-    disappeared_at: Optional[float] = None  # When this face left the frame
+    name: Optional[str] = None
+    disappeared_at: Optional[float] = None
+    _event_sent: bool = False
 
 
 @dataclass
@@ -110,7 +128,7 @@ class PackageDetection:
     bbox: tuple
     confidence: float
     detection_count: int = 1
-    disappeared_at: Optional[float] = None  # When this package left the frame
+    disappeared_at: Optional[float] = None
 
 
 @dataclass
@@ -127,38 +145,94 @@ class ActivityLogEntry:
     """Represents an entry in the activity log."""
 
     timestamp: float
-    event_type: str  # "person_detected", "package_detected", "person_left", etc.
+    event_type: str
     description: str
     details: Dict[str, Any] = field(default_factory=dict)
+
+
+T = TypeVar("T", FaceDetection, PackageDetection)
+
+
+def format_timestamp(timestamp: float) -> str:
+    """Format a Unix timestamp as a human-readable string."""
+    return time.strftime(TIMESTAMP_FORMAT, time.localtime(timestamp))
+
+
+def calculate_iou(bbox1: tuple, bbox2: tuple) -> float:
+    """Calculate Intersection over Union between two (x, y, w, h) bounding boxes."""
+    x1, y1, w1, h1 = bbox1
+    x2, y2, w2, h2 = bbox2
+
+    inter_x_min = max(x1, x2)
+    inter_y_min = max(y1, y2)
+    inter_x_max = min(x1 + w1, x2 + w2)
+    inter_y_max = min(y1 + h1, y2 + h2)
+
+    if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
+        return 0.0
+
+    inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+    union_area = w1 * h1 + w2 * h2 - inter_area
+
+    return inter_area / union_area if union_area > 0 else 0.0
+
+
+def get_bbox_centroid(bbox: tuple) -> tuple[float, float]:
+    """Get the centroid of a (x, y, w, h) bounding box."""
+    x, y, w, h = bbox
+    return (x + w / 2, y + h / 2)
+
+
+def calculate_centroid_distance(bbox1: tuple, bbox2: tuple) -> float:
+    """Calculate Euclidean distance between centroids of two bounding boxes."""
+    cx1, cy1 = get_bbox_centroid(bbox1)
+    cx2, cy2 = get_bbox_centroid(bbox2)
+    return ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
+
+
+def clamp_bbox(x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> tuple:
+    """Clamp bounding box coordinates to frame bounds."""
+    x = max(0, min(x, frame_w - 1))
+    y = max(0, min(y, frame_h - 1))
+    w = max(1, min(w, frame_w - x))
+    h = max(1, min(h, frame_h - y))
+    return (x, y, w, h)
+
+
+def draw_labeled_bbox(
+    frame: np.ndarray,
+    bbox: tuple,
+    label: str,
+    color: tuple,
+    frame_size: tuple[int, int],
+) -> None:
+    """Draw a labeled bounding box on the frame."""
+    x, y, w, h = [int(v) for v in bbox]
+    frame_h, frame_w = frame_size
+    x, y, w, h = clamp_bbox(x, y, w, h, frame_w, frame_h)
+    x2, y2 = x + w, y + h
+
+    cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
+    cv2.putText(frame, label, (x, max(10, y - 5)), FONT, FONT_MEDIUM, color, 1, cv2.LINE_AA)
+
+
+def draw_text(
+    frame: np.ndarray,
+    text: str,
+    position: tuple,
+    color: tuple = COLOR_WHITE,
+    scale: float = FONT_LARGE,
+) -> None:
+    """Draw text on the frame."""
+    cv2.putText(frame, text, position, FONT, scale, color, 1, cv2.LINE_AA)
 
 
 class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
     """
     Security camera processor that detects and recognizes faces and packages.
 
-    This processor:
-    - Detects faces in real-time using OpenCV
-    - Uses face_recognition library to identify unique individuals
-    - Detects packages using YOLO object detection model
-    - Prevents duplicate entries for the same person/package
-    - Maintains a 30-minute sliding window of unique visitors and packages
-    - Displays visitor count, package count, and thumbnails in a grid overlay
-
-    Args:
-        fps: Frame processing rate (default: 5)
-        max_workers: Number of worker threads (default: 10)
-        time_window: Time window in seconds to track faces/packages (default: 1800 = 30 minutes)
-        thumbnail_size: Size of face/package thumbnails in overlay (default: 80)
-        detection_interval: Minimum seconds between full face detection with identity matching (default: 2)
-        bbox_update_interval: Minimum seconds between fast bbox updates for tracking (default: 0.15)
-        face_match_tolerance: Face recognition tolerance (default: 0.6, lower = stricter)
-        model_path: Path to YOLO model file (default: "weights_custom.pt")
-        device: Device to run YOLO model on (default: "cpu")
-        package_detection_interval: Minimum seconds between package detections (default: 0.5)
-        package_fps: FPS for package detection (default: 1)
-        package_conf_threshold: Confidence threshold for package detection (default: 0.3)
-        max_tracked_packages: Maximum packages to track (default: None = unlimited).
-            If set to 1, single-package mode: always update the existing package.
+    Detects faces using face_recognition library and packages using YOLO.
+    Maintains a sliding window of unique visitors and packages with thumbnails.
     """
 
     name = "security_camera"
@@ -172,17 +246,15 @@ class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
         detection_interval: float = 2.0,
         bbox_update_interval: float = 0.3,
         face_match_tolerance: float = 0.6,
-        person_disappeared_threshold: float = 2.0,  # 連續 N 秒沒看到才判斷離開
+        person_disappeared_threshold: float = 2.0,
         model_path: str = "weights_custom.pt",
         device: str = "cpu",
         package_detection_interval: float = 0.4,
         package_fps: int = 1,
         package_conf_threshold: float = 0.6,
-        package_min_area_ratio: float = 0.01,  # Minimum area as ratio of frame (1% of frame)
-        package_max_area_ratio: float = 0.9,  # Maximum area as ratio of frame (90% of frame)
-        max_tracked_packages: Optional[
-            int
-        ] = None,  # None = unlimited, 1 = single-package mode
+        package_min_area_ratio: float = 0.01,
+        package_max_area_ratio: float = 0.9,
+        max_tracked_packages: Optional[int] = None,
     ):
         self.fps = fps
         self.max_workers = max_workers
@@ -199,455 +271,231 @@ class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
         self.package_max_area_ratio = package_max_area_ratio
         self.max_tracked_packages = max_tracked_packages
 
-        # Storage for unique detected faces (keyed by face_id)
         self._detected_faces: Dict[str, FaceDetection] = {}
+        self._detected_packages: Dict[str, PackageDetection] = {}
+        self._known_faces: Dict[str, KnownFace] = {}
+        self._activity_log: List[ActivityLogEntry] = []
+        self._max_activity_log_entries = 100
+
         self._last_detection_time = 0.0
         self._last_bbox_update_time = 0.0
-
-        # Storage for unique detected packages (keyed by package_id)
-        self._detected_packages: Dict[str, PackageDetection] = {}
         self._last_package_detection_time = 0.0
 
-        # Known faces database for named recognition
-        self._known_faces: Dict[str, KnownFace] = {}
-
-        # Activity log for event history
-        self._activity_log: List[ActivityLogEntry] = []
-        self._max_activity_log_entries = 100  # Keep last 100 events
-
-        # Thread pool for CPU-intensive operations
         self.executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="security_camera"
         )
-
-        # Shutdown flag to prevent new tasks
         self._shutdown = False
 
-        # Video track for publishing
         self._video_track: QueuedVideoTrack = QueuedVideoTrack()
         self._video_forwarder: Optional[VideoForwarder] = None
-
-        # Shared image state (for temporarily displaying images in the call)
         self._shared_image: Optional[av.VideoFrame] = None
         self._shared_image_until: float = 0.0
 
-        # Initialize YOLO model for package detection
         self.model_path = model_path
         self.device = device
         self.yolo_model: Optional[Any] = None
-        # Package-related classes detected by the model
-        # 支援自訂模型 (Box, Package) 和 COCO 預訓練模型 (suitcase, backpack, handbag)
-        self.package_detect_classes = [
-            # 自訂模型類別
-            "Box",
-            "Box_broken",
-            "Open_package",
-            "Package",
-            # COCO 預訓練模型類別 (類似包裹的物體)
-            "suitcase",      # 行李箱
-            "backpack",      # 背包
-            "handbag",       # 手提包
-            "bottle",        # 瓶子 (小包裹替代)
-            "book",          # 書本 (測試用)
-        ]
 
-        # Event manager for detection events
         self.events = EventManager()
-        self.events.register(PersonDetectedEvent)
-        self.events.register(PackageDetectedEvent)
-        self.events.register(PackageDisappearedEvent)
-        self.events.register(PersonDisappearedEvent)
+        for event_cls in [PersonDetectedEvent, PackageDetectedEvent, PackageDisappearedEvent, PersonDisappearedEvent]:
+            self.events.register(event_cls)
 
-        logger.info(
-            f"🎥 Security Camera Processor initialized (window: {time_window // 60}min)"
-        )
-
-    def _format_timestamp(self, timestamp: float) -> str:
-        """Format a Unix timestamp as a human-readable string."""
-        return time.strftime(TIMESTAMP_FORMAT, time.localtime(timestamp))
+        logger.info(f"Security Camera Processor initialized (window: {time_window // 60}min)")
 
     def _cleanup_old_items(
-        self, items: Dict[str, Any], current_time: float, item_type: str
+        self, items: Dict[str, T], current_time: float, item_type: str
     ) -> int:
-        """Remove items whose last_seen is older than the time window.
-
-        Returns the number of items removed.
-        """
+        """Remove items whose last_seen is older than the time window."""
         cutoff_time = current_time - self.time_window
-        to_remove = [
-            item_id for item_id, item in items.items() if item.last_seen < cutoff_time
-        ]
-        for item_id in to_remove:
-            del items[item_id]
+        to_remove = [k for k, v in items.items() if v.last_seen < cutoff_time]
+        for key in to_remove:
+            del items[key]
         if to_remove:
-            logger.debug(f"🧹 Cleaned up {len(to_remove)} old {item_type}(s)")
+            logger.debug(f"Cleaned up {len(to_remove)} old {item_type}(s)")
         return len(to_remove)
+
+    def _cleanup_old_faces(self, current_time: float) -> int:
+        return self._cleanup_old_items(self._detected_faces, current_time, "face")
+
+    def _cleanup_old_packages(self, current_time: float) -> int:
+        return self._cleanup_old_items(self._detected_packages, current_time, "package")
 
     async def on_warmup(self) -> Optional[Any]:
         """Load YOLO model for package detection."""
         try:
             from ultralytics import YOLO
-
             loop = asyncio.get_event_loop()
-
-            def load_yolo_model():
+            def load_model():
                 model = YOLO(self.model_path)
                 model.to(self.device)
                 return model
-
-            yolo_model = await loop.run_in_executor(self.executor, load_yolo_model)
-            logger.info(f"✅ YOLO model loaded: {self.model_path}")
+            yolo_model = await loop.run_in_executor(self.executor, load_model)
+            logger.info(f"YOLO model loaded: {self.model_path}")
             return yolo_model
         except Exception as e:
-            logger.warning(
-                f"⚠️ YOLO model failed to load: {e} - package detection disabled"
-            )
+            logger.warning(f"YOLO model failed to load: {e} - package detection disabled")
             return None
 
     def on_warmed_up(self, resource: Optional[Any]) -> None:
-        """Set the loaded YOLO model to the instance."""
         self.yolo_model = resource
 
-    def _cleanup_old_faces(self, current_time: float) -> int:
-        """Remove faces older than the time window."""
-        return self._cleanup_old_items(self._detected_faces, current_time, "face")
+    def _log_activity(
+        self, event_type: str, description: str, details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Add an entry to the activity log."""
+        self._activity_log.append(ActivityLogEntry(
+            timestamp=time.time(),
+            event_type=event_type,
+            description=description,
+            details=details or {},
+        ))
+        if len(self._activity_log) > self._max_activity_log_entries:
+            self._activity_log = self._activity_log[-self._max_activity_log_entries:]
 
-    def _cleanup_old_packages(self, current_time: float) -> int:
-        """Remove packages older than the time window."""
-        return self._cleanup_old_items(self._detected_packages, current_time, "package")
+    def _find_person_present_at(self, timestamp: float) -> Optional[FaceDetection]:
+        """Find who was present around a given timestamp (within 10 seconds)."""
+        candidates = [f for f in self._detected_faces.values() if abs(f.last_seen - timestamp) < 10.0]
+        return max(candidates, key=lambda f: f.last_seen) if candidates else None
 
-    def _check_for_picked_up_packages(self, current_time: float):
-        """Check if any packages have disappeared (picked up).
-
-        A package is considered "picked up" if it hasn't been seen for PICKUP_THRESHOLD_SECONDS
-        but was detected within the last PICKUP_MAX_AGE_SECONDS.
-        """
-        packages_picked_up = []
-
-        for package_id, package in list(self._detected_packages.items()):
+    def _check_for_picked_up_packages(self, current_time: float) -> None:
+        """Check if any packages have disappeared (picked up)."""
+        to_remove = []
+        for package_id, package in self._detected_packages.items():
             time_since_seen = current_time - package.last_seen
             package_age = current_time - package.first_seen
 
-            # Package disappeared recently (not seen for threshold, but was active recently)
-            if (
-                PICKUP_THRESHOLD_SECONDS < time_since_seen < PICKUP_MAX_AGE_SECONDS
-                and package_age < PICKUP_MAX_AGE_SECONDS
-            ):
-                packages_picked_up.append(package)
+            if PICKUP_THRESHOLD_SECONDS < time_since_seen < PICKUP_MAX_AGE_SECONDS and package_age < PICKUP_MAX_AGE_SECONDS:
+                picker = self._find_person_present_at(package.last_seen)
+                picker_name = picker.name if picker and picker.name else (picker.face_id[:8] if picker else "unknown person")
 
-        for package in packages_picked_up:
-            # Find who was present when the package disappeared
-            picker = self._find_person_present_at(package.last_seen)
-            picker_name = (
-                picker.name
-                if picker and picker.name
-                else (picker.face_id[:8] if picker else "unknown person")
-            )
+                logger.info(f"Package {package_id[:8]} was picked up by {picker_name}")
+                self._log_activity(
+                    "package_picked_up",
+                    f"Package picked up by {picker_name}",
+                    {
+                        "package_id": package_id[:8],
+                        "picked_up_by": picker_name,
+                        "picker_face_id": picker.face_id[:8] if picker else None,
+                        "picker_is_known": picker.name is not None if picker else False,
+                    },
+                )
+                to_remove.append(package_id)
 
-            logger.info(
-                f"📦 Package {package.package_id[:8]} was picked up by {picker_name}"
-            )
-
-            # Log activity
-            self._log_activity(
-                event_type="package_picked_up",
-                description=f"Package picked up by {picker_name}",
-                details={
-                    "package_id": package.package_id[:8],
-                    "picked_up_by": picker_name,
-                    "picker_face_id": picker.face_id[:8] if picker else None,
-                    "picker_is_known": picker.name is not None if picker else False,
-                },
-            )
-
-            # Remove the package from tracking
-            del self._detected_packages[package.package_id]
-
-    def _find_person_present_at(self, timestamp: float) -> Optional[FaceDetection]:
-        """Find who was present around a given timestamp.
-
-        Returns the person who was most recently seen around that time.
-        """
-        window = 10.0  # Look within 10 seconds of the timestamp
-
-        candidates = []
-        for face in self._detected_faces.values():
-            # Check if person was seen around that time
-            if abs(face.last_seen - timestamp) < window:
-                candidates.append(face)
-
-        if not candidates:
-            return None
-
-        # Return the most recently seen person
-        return max(candidates, key=lambda f: f.last_seen)
-
-    def _calculate_iou(self, bbox1: tuple, bbox2: tuple) -> float:
-        """Calculate Intersection over Union (IoU) between two bounding boxes.
-
-        Args:
-            bbox1: (x, y, w, h) format
-            bbox2: (x, y, w, h) format
-
-        Returns:
-            IoU value between 0 and 1
-        """
-        x1, y1, w1, h1 = bbox1
-        x2, y2, w2, h2 = bbox2
-
-        # Convert to (x_min, y_min, x_max, y_max) format
-        x1_min, y1_min = x1, y1
-        x1_max, y1_max = x1 + w1, y1 + h1
-        x2_min, y2_min = x2, y2
-        x2_max, y2_max = x2 + w2, y2 + h2
-
-        # Calculate intersection
-        inter_x_min = max(x1_min, x2_min)
-        inter_y_min = max(y1_min, y2_min)
-        inter_x_max = min(x1_max, x2_max)
-        inter_y_max = min(y1_max, y2_max)
-
-        if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
-            return 0.0
-
-        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
-        bbox1_area = w1 * h1
-        bbox2_area = w2 * h2
-        union_area = bbox1_area + bbox2_area - inter_area
-
-        if union_area == 0:
-            return 0.0
-
-        return inter_area / union_area
-
-    def _get_bbox_centroid(self, bbox: tuple) -> tuple[float, float]:
-        """Get the centroid of a bounding box.
-
-        Args:
-            bbox: (x, y, w, h) format
-
-        Returns:
-            (cx, cy) centroid coordinates
-        """
-        x, y, w, h = bbox
-        return (x + w / 2, y + h / 2)
-
-    def _calculate_centroid_distance(self, bbox1: tuple, bbox2: tuple) -> float:
-        """Calculate Euclidean distance between centroids of two bounding boxes.
-
-        Args:
-            bbox1: (x, y, w, h) format
-            bbox2: (x, y, w, h) format
-
-        Returns:
-            Distance in pixels
-        """
-        cx1, cy1 = self._get_bbox_centroid(bbox1)
-        cx2, cy2 = self._get_bbox_centroid(bbox2)
-        return ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5
+        for package_id in to_remove:
+            del self._detected_packages[package_id]
 
     def _find_matching_package(
         self, bbox: tuple, frame_shape: tuple[int, int], iou_threshold: float = 0.3
     ) -> Optional[str]:
-        """Find matching package based on IoU overlap, with centroid distance fallback.
-
-        Args:
-            bbox: (x, y, w, h) format
-            frame_shape: (height, width) of the frame for distance normalization
-            iou_threshold: Minimum IoU to consider a match (default: 0.3)
-
-        Returns:
-            package_id if match found, None otherwise
-        """
+        """Find matching package based on IoU overlap, with centroid distance fallback."""
         if not self._detected_packages:
             return None
 
-        # Single-package mode: if we're tracking exactly one package, always match it
-        # This handles cases where the package moves significantly between frames
         if self.max_tracked_packages == 1 and len(self._detected_packages) == 1:
             return next(iter(self._detected_packages.keys()))
 
-        best_match_id = None
+        best_match = None
         best_iou = 0.0
-
-        # First try IoU matching
-        for package_id, package in self._detected_packages.items():
-            iou = self._calculate_iou(bbox, package.bbox)
+        for pkg_id, pkg in self._detected_packages.items():
+            iou = calculate_iou(bbox, pkg.bbox)
             if iou > best_iou and iou >= iou_threshold:
                 best_iou = iou
-                best_match_id = package_id
+                best_match = pkg_id
 
-        if best_match_id is not None:
-            return best_match_id
+        if best_match:
+            return best_match
 
-        # Fallback: centroid distance matching
-        # Use 25% of frame diagonal as max distance threshold
         frame_h, frame_w = frame_shape
-        frame_diagonal = (frame_w**2 + frame_h**2) ** 0.5
-        max_centroid_distance = frame_diagonal * 0.25
-
+        max_distance = ((frame_w ** 2 + frame_h ** 2) ** 0.5) * 0.25
         best_distance = float("inf")
-        for package_id, package in self._detected_packages.items():
-            distance = self._calculate_centroid_distance(bbox, package.bbox)
-            if distance < best_distance and distance < max_centroid_distance:
-                best_distance = distance
-                best_match_id = package_id
 
-        return best_match_id
+        for pkg_id, pkg in self._detected_packages.items():
+            dist = calculate_centroid_distance(bbox, pkg.bbox)
+            if dist < best_distance and dist < max_distance:
+                best_distance = dist
+                best_match = pkg_id
+
+        return best_match
 
     def _detect_faces_sync(self, frame_rgb: np.ndarray) -> List[Dict[str, Any]]:
+        """Detect faces synchronously, returning bbox and encoding."""
         face_locations = face_recognition.face_locations(frame_rgb, model="hog")
-
         if not face_locations:
             return []
 
-        # Generate face encodings
         face_encodings = face_recognition.face_encodings(frame_rgb, face_locations)
-
-        # Convert to list of dicts with bbox in (x, y, w, h) format
-        results = []
-        for (top, right, bottom, left), encoding in zip(face_locations, face_encodings):
-            # Convert from (top, right, bottom, left) to (x, y, w, h)
-            x = left
-            y = top
-            w = right - left
-            h = bottom - top
-
-            results.append({"bbox": (x, y, w, h), "encoding": encoding})
-
-        return results
+        return [
+            {"bbox": (left, top, right - left, bottom - top), "encoding": enc}
+            for (top, right, bottom, left), enc in zip(face_locations, face_encodings)
+        ]
 
     def _find_matching_face(self, face_encoding: np.ndarray) -> Optional[str]:
+        """Find existing face that matches the encoding."""
         if not self._detected_faces:
             return None
 
-        # Get all existing face encodings
-        known_face_ids = list(self._detected_faces.keys())
-        known_encodings = [
-            self._detected_faces[face_id].face_encoding for face_id in known_face_ids
-        ]
+        face_ids = list(self._detected_faces.keys())
+        encodings = [self._detected_faces[fid].face_encoding for fid in face_ids]
+        matches = face_recognition.compare_faces(encodings, face_encoding, tolerance=self.face_match_tolerance)
 
-        # Compare against all known faces
-        matches = face_recognition.compare_faces(
-            known_encodings, face_encoding, tolerance=self.face_match_tolerance
-        )
-
-        # If we found a match, return the face_id
         for i, is_match in enumerate(matches):
             if is_match:
-                return known_face_ids[i]
-
+                return face_ids[i]
         return None
 
     def _find_known_face_name(self, face_encoding: np.ndarray) -> Optional[str]:
-        """Check if face matches any known/registered face and return the name."""
+        """Check if face matches any known/registered face."""
         if not self._known_faces:
             return None
 
-        known_names = list(self._known_faces.keys())
-        known_encodings = [
-            self._known_faces[name].face_encoding for name in known_names
-        ]
-
-        matches = face_recognition.compare_faces(
-            known_encodings, face_encoding, tolerance=self.face_match_tolerance
-        )
+        names = list(self._known_faces.keys())
+        encodings = [self._known_faces[n].face_encoding for n in names]
+        matches = face_recognition.compare_faces(encodings, face_encoding, tolerance=self.face_match_tolerance)
 
         for i, is_match in enumerate(matches):
             if is_match:
-                return known_names[i]
-
+                return names[i]
         return None
 
     def _detect_face_locations_fast_sync(self, frame_rgb: np.ndarray) -> List[tuple]:
-        """Fast face location detection without encoding (for bbox tracking).
-
-        Returns:
-            List of bboxes in (x, y, w, h) format
-        """
+        """Fast face location detection without encoding."""
         face_locations = face_recognition.face_locations(frame_rgb, model="hog")
-
-        bboxes = []
-        for top, right, bottom, left in face_locations:
-            x, y = left, top
-            w, h = right - left, bottom - top
-            bboxes.append((x, y, w, h))
-
-        return bboxes
+        return [(left, top, right - left, bottom - top) for top, right, bottom, left in face_locations]
 
     def _match_bbox_to_face(
-        self,
-        bbox: tuple,
-        frame_shape: tuple[int, int],
-        max_distance_ratio: float = 0.15,
+        self, bbox: tuple, frame_shape: tuple[int, int], max_distance_ratio: float = 0.15
     ) -> Optional[str]:
-        """Match a detected bbox to an existing face based on proximity.
-
-        Args:
-            bbox: (x, y, w, h) format
-            frame_shape: (height, width) of the frame
-            max_distance_ratio: Maximum centroid distance as ratio of frame diagonal
-
-        Returns:
-            face_id if match found, None otherwise
-        """
-        if not self._detected_faces:
-            return None
-
-        # Only consider faces that haven't disappeared
-        active_faces = {
-            fid: f
-            for fid, f in self._detected_faces.items()
-            if f.disappeared_at is None
-        }
+        """Match a detected bbox to an existing face based on proximity."""
+        active_faces = {fid: f for fid, f in self._detected_faces.items() if f.disappeared_at is None}
         if not active_faces:
             return None
 
         frame_h, frame_w = frame_shape
-        frame_diagonal = (frame_w**2 + frame_h**2) ** 0.5
-        max_distance = frame_diagonal * max_distance_ratio
+        max_distance = ((frame_w ** 2 + frame_h ** 2) ** 0.5) * max_distance_ratio
 
-        best_match_id = None
+        best_match = None
         best_distance = float("inf")
-
         for face_id, face in active_faces.items():
-            distance = self._calculate_centroid_distance(bbox, face.bbox)
-            if distance < best_distance and distance < max_distance:
-                best_distance = distance
-                best_match_id = face_id
+            dist = calculate_centroid_distance(bbox, face.bbox)
+            if dist < best_distance and dist < max_distance:
+                best_distance = dist
+                best_match = face_id
 
-        return best_match_id
+        return best_match
 
-    async def _update_face_bboxes_fast(
-        self, frame_bgr: np.ndarray, current_time: float
-    ) -> None:
-        """Fast bbox update for existing faces (no encoding, just location tracking)."""
-        if self._shutdown:
+    async def _update_face_bboxes_fast(self, frame_bgr: np.ndarray, current_time: float) -> None:
+        """Fast bbox update for existing faces."""
+        if self._shutdown or current_time - self._last_bbox_update_time < self.bbox_update_interval:
             return
 
-        # Check if enough time has passed since last bbox update
-        if current_time - self._last_bbox_update_time < self.bbox_update_interval:
-            return
-
-        # Skip if no active faces to track
-        active_faces = [
-            f for f in self._detected_faces.values() if f.disappeared_at is None
-        ]
+        active_faces = [f for f in self._detected_faces.values() if f.disappeared_at is None]
         if not active_faces:
             return
 
-        # Convert to RGB for face_recognition
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-        # Run fast location detection
         loop = asyncio.get_event_loop()
-        detected_bboxes = await loop.run_in_executor(
-            self.executor, self._detect_face_locations_fast_sync, frame_rgb
-        )
+        detected_bboxes = await loop.run_in_executor(self.executor, self._detect_face_locations_fast_sync, frame_rgb)
 
-        frame_shape = frame_bgr.shape[:2]  # (height, width)
-
-        # Update bboxes for matched faces
+        frame_shape = frame_bgr.shape[:2]
         for bbox in detected_bboxes:
             face_id = self._match_bbox_to_face(bbox, frame_shape)
             if face_id:
@@ -655,794 +503,388 @@ class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
 
         self._last_bbox_update_time = current_time
 
-    def _log_activity(
-        self,
-        event_type: str,
-        description: str,
-        details: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Add an entry to the activity log."""
-        entry = ActivityLogEntry(
-            timestamp=time.time(),
-            event_type=event_type,
-            description=description,
-            details=details or {},
-        )
-        self._activity_log.append(entry)
+    def _extract_thumbnail(self, frame_bgr: np.ndarray, bbox: tuple, padding_ratio: float = 0.0) -> np.ndarray:
+        """Extract and resize a thumbnail from the frame."""
+        x, y, w, h = [int(v) for v in bbox]
+        frame_h, frame_w = frame_bgr.shape[:2]
 
-        # Trim log if too long
-        if len(self._activity_log) > self._max_activity_log_entries:
-            self._activity_log = self._activity_log[-self._max_activity_log_entries :]
+        pad_x = int(w * padding_ratio)
+        pad_y = int(h * padding_ratio)
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(frame_w, x + w + pad_x)
+        y2 = min(frame_h, y + h + pad_y)
 
-    async def _detect_and_store_faces(
-        self, frame_bgr: np.ndarray, current_time: float
-    ) -> int:
-        """
-        Detect faces in frame and store new unique faces or update existing ones.
+        roi = frame_bgr[y1:y2, x1:x2]
+        if roi.size == 0:
+            return np.zeros((self.thumbnail_size, self.thumbnail_size, 3), dtype=np.uint8)
+        return cv2.resize(roi, (self.thumbnail_size, self.thumbnail_size))
 
-        Returns:
-            Number of new unique faces detected
-        """
-        if self._shutdown:
+    def _emit_person_event(self, face: FaceDetection, is_new: bool, current_time: float) -> None:
+        """Emit a person detected event."""
+        display_name = face.name or face.face_id[:8]
+        self.events.send(PersonDetectedEvent(
+            plugin_name="security_camera",
+            face_id=display_name,
+            is_new=is_new,
+            detection_count=face.detection_count,
+            first_seen=format_timestamp(face.first_seen),
+            last_seen=format_timestamp(current_time),
+        ))
+
+    def _emit_package_event(self, package: PackageDetection, is_new: bool, current_time: float) -> None:
+        """Emit a package detected event."""
+        self.events.send(PackageDetectedEvent(
+            plugin_name="security_camera",
+            package_id=package.package_id[:8],
+            is_new=is_new,
+            detection_count=package.detection_count,
+            confidence=package.confidence,
+            first_seen=format_timestamp(package.first_seen),
+            last_seen=format_timestamp(current_time),
+        ))
+
+    async def _detect_and_store_faces(self, frame_bgr: np.ndarray, current_time: float) -> int:
+        """Detect faces in frame and store new unique faces or update existing ones."""
+        if self._shutdown or current_time - self._last_detection_time < self.detection_interval:
             return 0
 
-        # Check if enough time has passed since last detection
-        if current_time - self._last_detection_time < self.detection_interval:
-            return 0
-
-        # Convert BGR to RGB for face_recognition library
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-        # Run detection in thread pool
         loop = asyncio.get_event_loop()
-        detected_faces = await loop.run_in_executor(
-            self.executor, self._detect_faces_sync, frame_rgb
-        )
+        detected_faces = await loop.run_in_executor(self.executor, self._detect_faces_sync, frame_rgb)
 
         new_faces = 0
-        updated_faces = 0
-        faces_seen_this_frame: set[str] = set()
+        faces_seen: set[str] = set()
 
         for face_data in detected_faces:
-            x, y, w, h = face_data["bbox"]
-            face_encoding = face_data["encoding"]
+            bbox = face_data["bbox"]
+            encoding = face_data["encoding"]
+            known_name = self._find_known_face_name(encoding)
+            matching_id = self._find_matching_face(encoding)
 
-            # Expand bounding box by 30% on each side for more context
-            frame_h, frame_w = frame_bgr.shape[:2]
-            pad_x = int(w * 0.3)
-            pad_y = int(h * 0.3)
-            x1 = max(0, x - pad_x)
-            y1 = max(0, y - pad_y)
-            x2 = min(frame_w, x + w + pad_x)
-            y2 = min(frame_h, y + h + pad_y)
+            if matching_id:
+                face = self._detected_faces[matching_id]
+                faces_seen.add(matching_id)
+                face.last_seen = current_time
+                face.bbox = bbox
+                face.face_image = self._extract_thumbnail(frame_bgr, bbox, padding_ratio=0.3)
 
-            # Extract face thumbnail with padding
-            face_roi = frame_bgr[y1:y2, x1:x2]
-            face_thumbnail = cv2.resize(
-                face_roi, (self.thumbnail_size, self.thumbnail_size)
-            )
+                if known_name and not face.name:
+                    face.name = known_name
 
-            # Check if this is a known/registered face
-            known_name = self._find_known_face_name(face_encoding)
-
-            # Check if this face matches any existing face in current session
-            matching_face_id = self._find_matching_face(face_encoding)
-
-            if matching_face_id:
-                # Update existing face
-                face_detection = self._detected_faces[matching_face_id]
-                faces_seen_this_frame.add(matching_face_id)
-                face_detection.last_seen = current_time
-                face_detection.bbox = (x, y, w, h)
-                # Update thumbnail to latest image
-                face_detection.face_image = face_thumbnail
-                # Update name if we now recognize them
-                if known_name and not face_detection.name:
-                    face_detection.name = known_name
-
-                # Only emit event if they returned after disappearing
-                if face_detection.disappeared_at is not None:
-                    face_detection.detection_count += 1
-                    updated_faces += 1
-                    display_name = face_detection.name or matching_face_id[:8]
-                    logger.info(
-                        f"👤 Returning: {display_name} (visit #{face_detection.detection_count})"
-                    )
-                    self.events.send(
-                        PersonDetectedEvent(
-                            plugin_name="security_camera",
-                            face_id=display_name,
-                            is_new=False,
-                            detection_count=face_detection.detection_count,
-                            first_seen=self._format_timestamp(
-                                face_detection.first_seen
-                            ),
-                            last_seen=self._format_timestamp(current_time),
-                        )
-                    )
-                    face_detection.disappeared_at = None
-                    face_detection._event_sent = False  # 重置 flag,可以再次發送離開事件
+                if face.disappeared_at is not None:
+                    face.detection_count += 1
+                    display_name = face.name or matching_id[:8]
+                    logger.info(f"Returning: {display_name} (visit #{face.detection_count})")
+                    self._emit_person_event(face, is_new=False, current_time=current_time)
+                    face.disappeared_at = None
+                    face._event_sent = False
             else:
-                # New unique face
                 face_id = str(uuid.uuid4())
                 detection = FaceDetection(
                     face_id=face_id,
-                    face_image=face_thumbnail,
-                    face_encoding=face_encoding,
+                    face_image=self._extract_thumbnail(frame_bgr, bbox, padding_ratio=0.3),
+                    face_encoding=encoding,
                     first_seen=current_time,
                     last_seen=current_time,
-                    bbox=(x, y, w, h),
-                    detection_count=1,
-                    name=known_name,  # Will be None if not recognized
-                    disappeared_at=None,
+                    bbox=bbox,
+                    name=known_name,
                 )
                 self._detected_faces[face_id] = detection
-                faces_seen_this_frame.add(face_id)
+                faces_seen.add(face_id)
                 new_faces += 1
 
                 display_name = known_name or face_id[:8]
-                logger.info(f"👤 New unique visitor detected: {display_name}")
+                logger.info(f"New unique visitor detected: {display_name}")
+                self._log_activity("person_arrived", f"New person arrived: {display_name}", {
+                    "face_id": face_id[:8],
+                    "name": known_name,
+                    "is_known": known_name is not None,
+                })
+                self._emit_person_event(detection, is_new=True, current_time=current_time)
 
-                # Log activity
-                self._log_activity(
-                    event_type="person_arrived",
-                    description=f"New person arrived: {display_name}",
-                    details={
-                        "face_id": face_id[:8],
-                        "name": known_name,
-                        "is_known": known_name is not None,
-                    },
-                )
+        self._handle_disappeared_faces(faces_seen, current_time)
 
-                # Emit event for new visitor
-                self.events.send(
-                    PersonDetectedEvent(
-                        plugin_name="security_camera",
-                        face_id=display_name,
-                        is_new=True,
-                        detection_count=1,
-                        first_seen=self._format_timestamp(current_time),
-                        last_seen=self._format_timestamp(current_time),
-                    )
-                )
-
-        # Mark faces that weren't seen this frame as disappeared
-        # 加入延遲判斷: 只有連續 N 秒沒看到才真正標記為離開
-        for face_id, face_detection in self._detected_faces.items():
-            if face_id not in faces_seen_this_frame:
-                if face_detection.disappeared_at is None:
-                    # 第一次沒看到,標記開始消失的時間 (但還不發送事件)
-                    face_detection.disappeared_at = current_time
-                    display_name = face_detection.name or face_id[:8]
-                    logger.debug(f"👤 Person temporarily out of frame: {display_name}")
-                elif current_time - face_detection.disappeared_at >= self.person_disappeared_threshold:
-                    # 已經超過閾值時間沒看到,真正判斷為離開 (只發送一次事件)
-                    # 使用一個 flag 避免重複發送
-                    if not hasattr(face_detection, '_event_sent') or not face_detection._event_sent:
-                        display_name = face_detection.name or face_id[:8]
-                        logger.info(f"👤 Person left: {display_name} (not seen for {self.person_disappeared_threshold}s)")
-
-                        # Log activity
-                        self._log_activity(
-                            event_type="person_left",
-                            description=f"Person left: {display_name}",
-                            details={
-                                "face_id": face_id[:8],
-                                "name": face_detection.name,
-                                "is_known": face_detection.name is not None,
-                            },
-                        )
-
-                        # Emit event (只發送一次)
-                        self.events.send(
-                            PersonDisappearedEvent(
-                                plugin_name="security_camera",
-                                face_id=face_id,
-                                name=face_detection.name,
-                                first_seen=self._format_timestamp(
-                                    face_detection.first_seen
-                                ),
-                                last_seen=self._format_timestamp(face_detection.last_seen),
-                            )
-                        )
-                        face_detection._event_sent = True
-
-        if new_faces > 0 or updated_faces > 0:
+        if new_faces > 0:
             self._last_detection_time = current_time
-
         return new_faces
 
+    def _handle_disappeared_faces(self, faces_seen: set[str], current_time: float) -> None:
+        """Handle faces that weren't seen in the current frame."""
+        for face_id, face in self._detected_faces.items():
+            if face_id in faces_seen:
+                continue
+
+            if face.disappeared_at is None:
+                face.disappeared_at = current_time
+                logger.debug(f"Person temporarily out of frame: {face.name or face_id[:8]}")
+            elif current_time - face.disappeared_at >= self.person_disappeared_threshold and not face._event_sent:
+                display_name = face.name or face_id[:8]
+                logger.info(f"Person left: {display_name} (not seen for {self.person_disappeared_threshold}s)")
+                self._log_activity("person_left", f"Person left: {display_name}", {
+                    "face_id": face_id[:8],
+                    "name": face.name,
+                    "is_known": face.name is not None,
+                })
+                self.events.send(PersonDisappearedEvent(
+                    plugin_name="security_camera",
+                    face_id=face_id,
+                    name=face.name,
+                    first_seen=format_timestamp(face.first_seen),
+                    last_seen=format_timestamp(face.last_seen),
+                ))
+                face._event_sent = True
+
     def _detect_packages_sync(self, frame_bgr: np.ndarray) -> List[Dict[str, Any]]:
-        """Run YOLO package detection synchronously.
-
-        Args:
-            frame_bgr: Frame in BGR format (OpenCV/YOLO expects BGR)
-
-        Returns:
-            List of detection dicts with bbox and confidence
-        """
+        """Run YOLO package detection synchronously."""
         if not self.yolo_model:
             return []
 
         height, width = frame_bgr.shape[:2]
-        all_detections = []
+        detections = []
 
         try:
-            results = self.yolo_model(
-                frame_bgr,
-                verbose=False,
-                conf=self.package_conf_threshold,
-                device=self.device,
-            )
-
-            if not results:
+            results = self.yolo_model(frame_bgr, verbose=False, conf=self.package_conf_threshold, device=self.device)
+            if not results or results[0].boxes is None or len(results[0].boxes) == 0:
                 return []
 
             result = results[0]
-
-            if result.boxes is None or len(result.boxes) == 0:
-                return []
-
             boxes = result.boxes.xyxy.cpu().numpy()
             confidences = result.boxes.conf.cpu().numpy()
             class_ids = result.boxes.cls.cpu().numpy().astype(int)
             class_names = result.names
 
             for box, conf, cls_id in zip(boxes, confidences, class_ids):
-                class_name_original = class_names[cls_id]
-                class_name = class_name_original.lower()
+                class_name = class_names[cls_id].lower()
+                if not any(dc.lower() in class_name for dc in PACKAGE_DETECT_CLASSES):
+                    continue
 
-                # Lowercase detect_class for case-insensitive matching
-                matches_package_class = any(
-                    detect_class.lower() in class_name
-                    for detect_class in self.package_detect_classes
-                )
+                x_min, y_min, x_max, y_max = [int(max(0, min(v, width if i % 2 == 0 else height))) for i, v in enumerate(box)]
+                w, h = x_max - x_min, y_max - y_min
 
-                if matches_package_class:
-                    x_min, y_min, x_max, y_max = box
+                area_ratio = (w * h) / (width * height)
+                if area_ratio < self.package_min_area_ratio or area_ratio > self.package_max_area_ratio:
+                    continue
 
-                    x_min = int(max(0, min(x_min, width - 1)))
-                    y_min = int(max(0, min(y_min, height - 1)))
-                    x_max = int(max(x_min + 1, min(x_max, width)))
-                    y_max = int(max(y_min + 1, min(y_max, height)))
-
-                    x = x_min
-                    y = y_min
-                    w = x_max - x_min
-                    h = y_max - y_min
-
-                    # Filter by size to exclude walls and very small detections
-                    frame_area = width * height
-                    detection_area = w * h
-                    area_ratio = detection_area / frame_area
-
-                    # Filter by size
-                    if (
-                        area_ratio < self.package_min_area_ratio
-                        or area_ratio > self.package_max_area_ratio
-                    ):
-                        continue
-
-                    all_detections.append(
-                        {
-                            "bbox": (x, y, w, h),
-                            "confidence": float(conf),
-                            "label": class_name_original,
-                        }
-                    )
+                detections.append({"bbox": (x_min, y_min, w, h), "confidence": float(conf), "label": class_names[cls_id]})
 
         except Exception as e:
-            logger.warning(f"⚠️ Package detection failed: {e}")
+            logger.warning(f"Package detection failed: {e}")
 
-        return all_detections
+        return detections
 
-    async def _detect_and_store_packages(
-        self, frame_bgr: np.ndarray, current_time: float
-    ) -> int:
-        """
-        Detect packages in frame and store new unique packages or update existing ones.
-
-        Returns:
-            Number of new unique packages detected
-        """
-        if self._shutdown:
+    async def _detect_and_store_packages(self, frame_bgr: np.ndarray, current_time: float) -> int:
+        """Detect packages in frame and store new unique packages or update existing ones."""
+        if self._shutdown or not self.yolo_model:
             return 0
 
-        if not self.yolo_model:
+        if current_time - self._last_package_detection_time < self.package_detection_interval:
             return 0
 
-        # Check if enough time has passed since last detection
-        if (
-            current_time - self._last_package_detection_time
-            < self.package_detection_interval
-        ):
-            return 0
-
-        # Run detection in thread pool
-        # Note: YOLO expects BGR input (OpenCV format), not RGB
         loop = asyncio.get_event_loop()
-        detected_packages = await loop.run_in_executor(
-            self.executor, self._detect_packages_sync, frame_bgr
-        )
+        detected_packages = await loop.run_in_executor(self.executor, self._detect_packages_sync, frame_bgr)
 
         new_packages = 0
-        updated_packages = 0
-        packages_seen_this_frame: set[str] = set()
+        packages_seen: set[str] = set()
+        frame_shape = frame_bgr.shape[:2]
 
-        for package_data in detected_packages:
-            x, y, w, h = package_data["bbox"]
-            confidence = package_data["confidence"]
+        for pkg_data in detected_packages:
+            bbox = pkg_data["bbox"]
+            confidence = pkg_data["confidence"]
+            x, y, w, h = clamp_bbox(*[int(v) for v in bbox], frame_bgr.shape[1], frame_bgr.shape[0])
 
-            # Ensure coordinates are integers and within frame bounds
-            height, width = frame_bgr.shape[:2]
-            x = int(max(0, min(x, width - 1)))
-            y = int(max(0, min(y, height - 1)))
-            w = int(max(1, min(w, width - x)))
-            h = int(max(1, min(h, height - y)))
-
-            # Extract package thumbnail
-            package_roi = frame_bgr[y : y + h, x : x + w]
-            if package_roi.size == 0:
+            thumbnail = self._extract_thumbnail(frame_bgr, (x, y, w, h))
+            if thumbnail.size == 0:
                 continue
 
-            package_thumbnail = cv2.resize(
-                package_roi, (self.thumbnail_size, self.thumbnail_size)
-            )
+            matching_id = self._find_matching_package((x, y, w, h), frame_shape)
 
-            # Check if this package matches any existing package
-            matching_package_id = self._find_matching_package(
-                (x, y, w, h), (height, width)
-            )
+            if matching_id:
+                pkg = self._detected_packages[matching_id]
+                packages_seen.add(matching_id)
+                pkg.last_seen = current_time
+                pkg.bbox = (x, y, w, h)
+                pkg.confidence = max(pkg.confidence, confidence)
+                pkg.package_image = thumbnail
 
-            if matching_package_id:
-                # Update existing package
-                package_detection = self._detected_packages[matching_package_id]
-                packages_seen_this_frame.add(matching_package_id)
-                package_detection.last_seen = current_time
-                package_detection.bbox = (x, y, w, h)
-                package_detection.confidence = max(
-                    package_detection.confidence, confidence
-                )
-                package_detection.package_image = package_thumbnail
-
-                # Only emit event if package returned after disappearing
-                if package_detection.disappeared_at is not None:
-                    package_detection.detection_count += 1
-                    updated_packages += 1
-                    logger.info(f"📦 Package returned: {matching_package_id[:8]}")
-                    self.events.send(
-                        PackageDetectedEvent(
-                            plugin_name="security_camera",
-                            package_id=matching_package_id[:8],
-                            is_new=False,
-                            detection_count=package_detection.detection_count,
-                            confidence=package_detection.confidence,
-                            first_seen=self._format_timestamp(
-                                package_detection.first_seen
-                            ),
-                            last_seen=self._format_timestamp(current_time),
-                        )
-                    )
-                    package_detection.disappeared_at = None
+                if pkg.disappeared_at is not None:
+                    pkg.detection_count += 1
+                    logger.info(f"Package returned: {matching_id[:8]}")
+                    self._emit_package_event(pkg, is_new=False, current_time=current_time)
+                    pkg.disappeared_at = None
             else:
-                # New unique package
                 package_id = str(uuid.uuid4())
                 detection = PackageDetection(
                     package_id=package_id,
-                    package_image=package_thumbnail,
+                    package_image=thumbnail,
                     first_seen=current_time,
                     last_seen=current_time,
                     bbox=(x, y, w, h),
                     confidence=confidence,
-                    detection_count=1,
-                    disappeared_at=None,
                 )
                 self._detected_packages[package_id] = detection
-                packages_seen_this_frame.add(package_id)
+                packages_seen.add(package_id)
                 new_packages += 1
-                logger.info(f"📦 New unique package detected: {package_id[:8]}")
 
-                # Log activity
-                self._log_activity(
-                    event_type="package_arrived",
-                    description=f"New package detected (confidence: {confidence:.2f})",
-                    details={
-                        "package_id": package_id[:8],
-                        "confidence": confidence,
-                    },
-                )
+                logger.info(f"New unique package detected: {package_id[:8]}")
+                self._log_activity("package_arrived", f"New package detected (confidence: {confidence:.2f})", {
+                    "package_id": package_id[:8],
+                    "confidence": confidence,
+                })
+                self._emit_package_event(detection, is_new=True, current_time=current_time)
 
-                # Emit event for new package
-                self.events.send(
-                    PackageDetectedEvent(
-                        plugin_name="security_camera",
-                        package_id=package_id[:8],
-                        is_new=True,
-                        detection_count=1,
-                        confidence=confidence,
-                        first_seen=self._format_timestamp(current_time),
-                        last_seen=self._format_timestamp(current_time),
-                    )
-                )
+        self._handle_disappeared_packages(packages_seen, current_time)
 
-        # Mark packages that weren't seen this frame as disappeared
-        for package_id, package_detection in self._detected_packages.items():
-            if package_id not in packages_seen_this_frame:
-                if package_detection.disappeared_at is None:
-                    # First time disappearing - mark it and emit event
-                    package_detection.disappeared_at = current_time
-
-                    # Find who was present when package disappeared
-                    picker = self._find_person_present_at(package_detection.last_seen)
-                    picker_face_id = picker.face_id if picker else None
-                    picker_name = picker.name if picker else None
-
-                    picker_display = picker_name or (
-                        picker_face_id[:8] if picker_face_id else "unknown"
-                    )
-                    logger.info(
-                        f"📦 Package disappeared: {package_id[:8]} (confidence: {package_detection.confidence:.2f}, picker: {picker_display})"
-                    )
-                    self.events.send(
-                        PackageDisappearedEvent(
-                            plugin_name="security_camera",
-                            package_id=package_id[:8],
-                            confidence=package_detection.confidence,
-                            first_seen=self._format_timestamp(
-                                package_detection.first_seen
-                            ),
-                            last_seen=self._format_timestamp(current_time),
-                            picker_face_id=picker_face_id,
-                            picker_name=picker_name,
-                        )
-                    )
-
-        if new_packages > 0 or updated_packages > 0:
+        if new_packages > 0:
             self._last_package_detection_time = current_time
-
         return new_packages
 
-    def _create_overlay(
-        self, frame_bgr: np.ndarray, face_count: int, package_count: int
-    ) -> np.ndarray:
-        """
-        Create video overlay with face count, package count, and thumbnail grid.
+    def _handle_disappeared_packages(self, packages_seen: set[str], current_time: float) -> None:
+        """Handle packages that weren't seen in the current frame."""
+        for pkg_id, pkg in self._detected_packages.items():
+            if pkg_id in packages_seen or pkg.disappeared_at is not None:
+                continue
 
-        Args:
-            frame_bgr: Original frame in BGR format
-            face_count: Number of faces in time window
-            package_count: Number of packages in time window
+            pkg.disappeared_at = current_time
+            picker = self._find_person_present_at(pkg.last_seen)
+            picker_display = picker.name if picker and picker.name else (picker.face_id[:8] if picker else "unknown")
 
-        Returns:
-            Frame with overlay applied
-        """
+            logger.info(f"Package disappeared: {pkg_id[:8]} (confidence: {pkg.confidence:.2f}, picker: {picker_display})")
+            self.events.send(PackageDisappearedEvent(
+                plugin_name="security_camera",
+                package_id=pkg_id[:8],
+                confidence=pkg.confidence,
+                first_seen=format_timestamp(pkg.first_seen),
+                last_seen=format_timestamp(current_time),
+                picker_face_id=picker.face_id if picker else None,
+                picker_name=picker.name if picker else None,
+            ))
+
+    def _create_overlay(self, frame_bgr: np.ndarray, face_count: int, package_count: int) -> np.ndarray:
+        """Create video overlay with counts, bounding boxes, and thumbnail grid."""
         height, width = frame_bgr.shape[:2]
+        frame = frame_bgr.copy()
+        frame_size = (height, width)
 
-        # Create a copy to draw on
-        frame_with_overlay = frame_bgr.copy()
-
-        # Draw face bounding boxes on the frame (only for currently visible faces)
+        # Draw bounding boxes for visible faces
         for face in self._detected_faces.values():
-            # Only draw if face hasn't disappeared (disappeared_at is None)
-            if face.disappeared_at is not None:
-                continue
-            x, y, w, h = face.bbox
-            # Ensure coordinates are integers
-            x, y, w, h = int(x), int(y), int(w), int(h)
-            # Ensure coordinates are within bounds
-            x = max(0, min(x, width - 1))
-            y = max(0, min(y, height - 1))
-            x2 = min(x + w, width)
-            y2 = min(y + h, height)
-            # Draw green rectangle for faces
-            cv2.rectangle(frame_with_overlay, (x, y), (x2, y2), (0, 255, 0), 2)
-            # Draw face label
-            display_name = face.name or face.face_id[:8]
-            label_text = f"{display_name}"
-            cv2.putText(
-                frame_with_overlay,
-                label_text,
-                (x, max(10, y - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
+            if face.disappeared_at is None:
+                draw_labeled_bbox(frame, face.bbox, face.name or face.face_id[:8], COLOR_GREEN, frame_size)
 
-        # Draw package bounding boxes on the frame (only for currently visible packages)
-        for package in self._detected_packages.values():
-            # Only draw if package hasn't disappeared (disappeared_at is None)
-            if package.disappeared_at is not None:
-                continue
-            x, y, w, h = package.bbox
-            # Ensure coordinates are integers
-            x, y, w, h = int(x), int(y), int(w), int(h)
-            # Ensure coordinates are within bounds
-            x = max(0, min(x, width - 1))
-            y = max(0, min(y, height - 1))
-            x2 = min(x + w, width)
-            y2 = min(y + h, height)
-            # Draw brighter blue rectangle for packages (BGR: brighter blue)
-            cv2.rectangle(frame_with_overlay, (x, y), (x2, y2), (255, 150, 150), 2)
-            # Draw package label in brighter blue
-            label_text = f"Package {package.confidence:.2f}"
-            cv2.putText(
-                frame_with_overlay,
-                label_text,
-                (x, max(10, y - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (255, 150, 150),
-                1,
-                cv2.LINE_AA,
-            )
+        # Draw bounding boxes for visible packages
+        for pkg in self._detected_packages.values():
+            if pkg.disappeared_at is None:
+                draw_labeled_bbox(frame, pkg.bbox, f"Package {pkg.confidence:.2f}", COLOR_BLUE, frame_size)
 
-        # Draw semi-transparent overlay panel on right side
-        overlay = frame_with_overlay.copy()
-        cv2.rectangle(
-            overlay,
-            (width - OVERLAY_WIDTH, 0),
-            (width, height),
-            (40, 40, 40),
-            -1,
-        )
-        cv2.addWeighted(overlay, 0.7, frame_with_overlay, 0.3, 0, frame_with_overlay)
+        # Draw semi-transparent overlay panel
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (width - OVERLAY_WIDTH, 0), (width, height), COLOR_DARK_GRAY, -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
-        # Draw header text
-        header_text = "SECURITY CAMERA"
-        cv2.putText(
-            frame_with_overlay,
-            header_text,
-            (width - OVERLAY_WIDTH + 10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        # Draw header and counts
+        base_x = width - OVERLAY_WIDTH + 10
+        draw_text(frame, "SECURITY CAMERA", (base_x, 25), COLOR_WHITE, FONT_LARGE)
 
-        # Calculate currently visible counts
-        visible_faces = sum(
-            1 for f in self._detected_faces.values() if f.disappeared_at is None
-        )
-        visible_packages = sum(
-            1 for p in self._detected_packages.values() if p.disappeared_at is None
-        )
+        visible_faces = sum(1 for f in self._detected_faces.values() if f.disappeared_at is None)
+        visible_packages = sum(1 for p in self._detected_packages.values() if p.disappeared_at is None)
 
-        # Draw face count with visible indicator
-        count_text = f"Visitors: {visible_faces}/{face_count}"
-        cv2.putText(
-            frame_with_overlay,
-            count_text,
-            (width - OVERLAY_WIDTH + 10, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # Draw package count with visible indicator (brighter blue)
-        package_text = f"Packages: {visible_packages}/{package_count}"
-        cv2.putText(
-            frame_with_overlay,
-            package_text,
-            (width - OVERLAY_WIDTH + 10, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 150, 150),
-            1,
-            cv2.LINE_AA,
-        )
+        draw_text(frame, f"Visitors: {visible_faces}/{face_count}", (base_x, 50), COLOR_GREEN, 0.45)
+        draw_text(frame, f"Packages: {visible_packages}/{package_count}", (base_x, 70), COLOR_BLUE, 0.45)
 
         # Draw legend
         legend_y = 90
-        # Green square for faces
-        cv2.rectangle(
-            frame_with_overlay,
-            (width - OVERLAY_WIDTH + 10, legend_y - 8),
-            (width - OVERLAY_WIDTH + 20, legend_y + 2),
-            (0, 255, 0),
-            -1,
-        )
-        cv2.putText(
-            frame_with_overlay,
-            "Person",
-            (width - OVERLAY_WIDTH + 25, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            (200, 200, 200),
-            1,
-            cv2.LINE_AA,
-        )
-        # Blue square for packages
-        cv2.rectangle(
-            frame_with_overlay,
-            (width - OVERLAY_WIDTH + 80, legend_y - 8),
-            (width - OVERLAY_WIDTH + 90, legend_y + 2),
-            (255, 150, 150),
-            -1,
-        )
-        cv2.putText(
-            frame_with_overlay,
-            "Package",
-            (width - OVERLAY_WIDTH + 95, legend_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.35,
-            (200, 200, 200),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.rectangle(frame, (base_x, legend_y - 8), (base_x + 10, legend_y + 2), COLOR_GREEN, -1)
+        draw_text(frame, "Person", (base_x + 15, legend_y), COLOR_GRAY, FONT_SMALL)
+        cv2.rectangle(frame, (base_x + 70, legend_y - 8), (base_x + 80, legend_y + 2), COLOR_BLUE, -1)
+        draw_text(frame, "Package", (base_x + 85, legend_y), COLOR_GRAY, FONT_SMALL)
 
-        # Draw thumbnail grid (faces and packages combined)
-        grid_start_y = 105  # Start below the legend
+        # Draw thumbnail grid
+        self._draw_thumbnail_grid(frame, width, height)
+
+        # Draw timestamp
+        draw_text(frame, format_timestamp(time.time()), (10, height - 10), COLOR_WHITE, FONT_LARGE)
+
+        return frame
+
+    def _draw_thumbnail_grid(self, frame: np.ndarray, width: int, height: int) -> None:
+        """Draw the thumbnail grid for detected faces and packages."""
+        grid_start_y = 105
         grid_padding = 10
         thumb_size = self.thumbnail_size
 
-        # Combine faces and packages, sorted by last_seen
         all_detections = []
-
-        # Add faces
         for face in self._detected_faces.values():
-            all_detections.append(
-                {
-                    "type": "face",
-                    "image": face.face_image,
-                    "last_seen": face.last_seen,
-                    "detection_count": face.detection_count,
-                    "name": face.name or face.face_id[:8],
-                }
-            )
+            all_detections.append({
+                "type": "face",
+                "image": face.face_image,
+                "last_seen": face.last_seen,
+                "detection_count": face.detection_count,
+            })
+        for pkg in self._detected_packages.values():
+            all_detections.append({
+                "type": "package",
+                "image": pkg.package_image,
+                "last_seen": pkg.last_seen,
+                "detection_count": pkg.detection_count,
+            })
 
-        # Add packages
-        for package in self._detected_packages.values():
-            all_detections.append(
-                {
-                    "type": "package",
-                    "image": package.package_image,
-                    "last_seen": package.last_seen,
-                    "detection_count": package.detection_count,
-                    "package_id": package.package_id[:8],
-                    "confidence": package.confidence,
-                }
-            )
+        recent = sorted(all_detections, key=lambda d: d["last_seen"], reverse=True)[:MAX_THUMBNAILS]
 
-        # Sort by last_seen (most recent first) and take top MAX_THUMBNAILS
-        recent_detections = sorted(
-            all_detections, key=lambda d: d["last_seen"], reverse=True
-        )[:MAX_THUMBNAILS]
-
-        for idx, detection in enumerate(recent_detections):
-            row = idx // GRID_COLS
-            col = idx % GRID_COLS
-
+        for idx, det in enumerate(recent):
+            row, col = idx // GRID_COLS, idx % GRID_COLS
             x_pos = width - OVERLAY_WIDTH + 10 + col * (thumb_size + grid_padding)
             y_pos = grid_start_y + row * (thumb_size + grid_padding)
 
-            # Check if we're still within the frame bounds
             if y_pos + thumb_size > height:
                 break
 
-            # Draw thumbnail
             try:
-                frame_with_overlay[
-                    y_pos : y_pos + thumb_size, x_pos : x_pos + thumb_size
-                ] = detection["image"]
+                frame[y_pos:y_pos + thumb_size, x_pos:x_pos + thumb_size] = det["image"]
+                border_color = COLOR_GREEN if det["type"] == "face" else COLOR_BLUE
+                cv2.rectangle(frame, (x_pos, y_pos), (x_pos + thumb_size, y_pos + thumb_size), border_color, 2)
 
-                # Draw colored border to distinguish type
-                border_color = (
-                    (0, 255, 0) if detection["type"] == "face" else (255, 150, 150)
-                )  # Green for faces, blue for packages
-                cv2.rectangle(
-                    frame_with_overlay,
-                    (x_pos, y_pos),
-                    (x_pos + thumb_size, y_pos + thumb_size),
-                    border_color,
-                    2,
-                )
-
-                # Draw detection count badge
-                if detection["detection_count"] > 1:
-                    badge_text = f"{detection['detection_count']}x"
-                    badge_size = cv2.getTextSize(
-                        badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1
-                    )[0]
+                if det["detection_count"] > 1:
+                    badge_text = f"{det['detection_count']}x"
+                    badge_size = cv2.getTextSize(badge_text, FONT, FONT_SMALL, 1)[0]
                     badge_x = x_pos + thumb_size - badge_size[0] - 2
                     badge_y = y_pos + thumb_size - 2
-
-                    # Draw badge background
-                    cv2.rectangle(
-                        frame_with_overlay,
-                        (badge_x - 2, badge_y - badge_size[1] - 2),
-                        (x_pos + thumb_size, y_pos + thumb_size),
-                        (0, 0, 0),
-                        -1,
-                    )
-
-                    # Draw badge text
-                    cv2.putText(
-                        frame_with_overlay,
-                        badge_text,
-                        (badge_x, badge_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.3,
-                        (255, 255, 255),
-                        1,
-                        cv2.LINE_AA,
-                    )
+                    cv2.rectangle(frame, (badge_x - 2, badge_y - badge_size[1] - 2), (x_pos + thumb_size, y_pos + thumb_size), COLOR_BLACK, -1)
+                    cv2.putText(frame, badge_text, (badge_x, badge_y), FONT, FONT_SMALL, COLOR_WHITE, 1, cv2.LINE_AA)
             except Exception as e:
                 logger.debug(f"Failed to draw thumbnail: {e}")
-                continue
 
-        timestamp_text = self._format_timestamp(time.time())
-        cv2.putText(
-            frame_with_overlay,
-            timestamp_text,
-            (10, height - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-        return frame_with_overlay
-
-    async def _process_and_add_frame(self, frame: av.VideoFrame):
+    async def _process_and_add_frame(self, frame: av.VideoFrame) -> None:
+        """Process a single video frame."""
         try:
             current_time = time.time()
 
-            # Check if we're currently sharing an image
-            if (
-                self._shared_image is not None
-                and current_time < self._shared_image_until
-            ):
+            if self._shared_image is not None and current_time < self._shared_image_until:
                 await self._video_track.add_frame(self._shared_image)
                 return
             elif self._shared_image is not None:
-                # Clear expired shared image
                 self._shared_image = None
                 self._shared_image_until = 0.0
-                logger.info("📺 Shared image display ended, resuming camera feed")
+                logger.info("Shared image display ended, resuming camera feed")
 
-            # Convert frame to BGR (OpenCV format)
             frame_rgb = frame.to_ndarray(format="rgb24")
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-            # Clean up old faces and packages
             self._cleanup_old_faces(current_time)
             self._cleanup_old_packages(current_time)
-
-            # Check if any packages were picked up
             self._check_for_picked_up_packages(current_time)
 
-            # Detect and store new faces (full detection with identity matching)
             await self._detect_and_store_faces(frame_bgr, current_time)
-
-            # Fast bbox update for responsive face tracking between full detections
             await self._update_face_bboxes_fast(frame_bgr, current_time)
-
-            # Detect and store new packages
             await self._detect_and_store_packages(frame_bgr, current_time)
 
-            # Create overlay with stats and thumbnails
-            frame_with_overlay = self._create_overlay(
-                frame_bgr, len(self._detected_faces), len(self._detected_packages)
-            )
-
-            # Convert back to RGB and then to av.VideoFrame
+            frame_with_overlay = self._create_overlay(frame_bgr, len(self._detected_faces), len(self._detected_packages))
             frame_rgb_overlay = cv2.cvtColor(frame_with_overlay, cv2.COLOR_BGR2RGB)
-            processed_frame = av.VideoFrame.from_ndarray(
-                frame_rgb_overlay, format="rgb24"
-            )
+            processed_frame = av.VideoFrame.from_ndarray(frame_rgb_overlay, format="rgb24")
 
-            # Publish the processed frame
             await self._video_track.add_frame(processed_frame)
 
         except Exception as e:
-            logger.exception(f"❌ Frame processing failed: {e}")
-            # Pass through original frame on error
+            logger.exception(f"Frame processing failed: {e}")
             await self._video_track.add_frame(frame)
 
     async def process_video(
@@ -1454,15 +896,11 @@ class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
         """Set up video processing pipeline."""
         if shared_forwarder is not None:
             self._video_forwarder = shared_forwarder
-            self._video_forwarder.add_frame_handler(
-                self._process_and_add_frame, fps=float(self.fps), name="security_camera"
-            )
+            self._video_forwarder.add_frame_handler(self._process_and_add_frame, fps=float(self.fps), name="security_camera")
         else:
-            self._video_forwarder = VideoForwarder(
-                track, max_buffer=30, fps=self.fps, name="security_camera_forwarder"
-            )
+            self._video_forwarder = VideoForwarder(track, max_buffer=30, fps=self.fps, name="security_camera_forwarder")
             self._video_forwarder.add_frame_handler(self._process_and_add_frame)
-        logger.info("✅ Security camera video processing started")
+        logger.info("Security camera video processing started")
 
     async def stop_processing(self) -> None:
         """Stop processing video tracks."""
@@ -1474,264 +912,130 @@ class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
         return self._video_track
 
     def state(self) -> Dict[str, Any]:
-        """
-        Return current state for LLM context.
-
-        Returns:
-            Dictionary with visitor count, package count, and timing info
-        """
+        """Return current state for LLM context."""
         current_time = time.time()
         self._cleanup_old_faces(current_time)
         self._cleanup_old_packages(current_time)
 
-        total_face_detections = sum(
-            face.detection_count for face in self._detected_faces.values()
-        )
-        total_package_detections = sum(
-            package.detection_count for package in self._detected_packages.values()
-        )
-
-        # Count currently visible (not disappeared) items
-        currently_visible_visitors = sum(
-            1 for f in self._detected_faces.values() if f.disappeared_at is None
-        )
-        currently_visible_packages = sum(
-            1 for p in self._detected_packages.values() if p.disappeared_at is None
-        )
-
         return {
             "unique_visitors": len(self._detected_faces),
-            "currently_visible_visitors": currently_visible_visitors,
-            "total_face_detections": total_face_detections,
+            "currently_visible_visitors": sum(1 for f in self._detected_faces.values() if f.disappeared_at is None),
+            "total_face_detections": sum(f.detection_count for f in self._detected_faces.values()),
             "unique_packages": len(self._detected_packages),
-            "currently_visible_packages": currently_visible_packages,
-            "total_package_detections": total_package_detections,
+            "currently_visible_packages": sum(1 for p in self._detected_packages.values() if p.disappeared_at is None),
+            "total_package_detections": sum(p.detection_count for p in self._detected_packages.values()),
             "time_window_minutes": self.time_window // 60,
-            "last_face_detection_time": (
-                self._format_timestamp(self._last_detection_time)
-                if self._last_detection_time > 0
-                else "No detections yet"
-            ),
-            "last_package_detection_time": (
-                self._format_timestamp(self._last_package_detection_time)
-                if self._last_package_detection_time > 0
-                else "No detections yet"
-            ),
+            "last_face_detection_time": format_timestamp(self._last_detection_time) if self._last_detection_time > 0 else "No detections yet",
+            "last_package_detection_time": format_timestamp(self._last_package_detection_time) if self._last_package_detection_time > 0 else "No detections yet",
         }
 
     def get_face_image(self, face_id: str) -> Optional[np.ndarray]:
-        """
-        Get the face image for a given face ID.
+        """Get the face image for a given face ID."""
+        face = self._detected_faces.get(face_id)
+        return face.face_image if face else None
 
-        Args:
-            face_id: The ID of the face to retrieve
-
-        Returns:
-            The face image (numpy array) or None if not found
-        """
-        if face_id in self._detected_faces:
-            return self._detected_faces[face_id].face_image
-        return None
-
-    def share_image(
-        self,
-        image: bytes | np.ndarray,
-        duration: float = 5.0,
-    ) -> None:
-        """
-        Temporarily display an image in the video feed.
-
-        The image will be shown instead of the camera feed for the specified duration,
-        then automatically return to the normal camera view.
-
-        Args:
-            image: Image data as PNG/JPEG bytes or numpy array (BGR or RGB format)
-            duration: How long to display the image in seconds (default: 5.0)
-        """
-        # Convert bytes to numpy array if needed
+    def share_image(self, image: bytes | np.ndarray, duration: float = 5.0) -> None:
+        """Temporarily display an image in the video feed."""
         if isinstance(image, bytes):
             nparr = np.frombuffer(image, np.uint8)
             img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         else:
             img_bgr = image
 
-        # Resize to match video track dimensions (maintain aspect ratio)
-        track_width = self._video_track.width
-        track_height = self._video_track.height
+        track_w, track_h = self._video_track.width, self._video_track.height
         h, w = img_bgr.shape[:2]
-        scale = min(track_width / w, track_height / h)
+        scale = min(track_w / w, track_h / h)
         new_w, new_h = int(w * scale), int(h * scale)
         resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        # Center the image on a black background
-        canvas = np.zeros((track_height, track_width, 3), dtype=np.uint8)
-        x_offset = (track_width - new_w) // 2
-        y_offset = (track_height - new_h) // 2
-        canvas[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized
+        canvas = np.zeros((track_h, track_w, 3), dtype=np.uint8)
+        x_offset, y_offset = (track_w - new_w) // 2, (track_h - new_h) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
 
-        # Convert to RGB and create av.VideoFrame
         canvas_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         self._shared_image = av.VideoFrame.from_ndarray(canvas_rgb, format="rgb24")
         self._shared_image_until = time.time() + duration
 
-        logger.info(f"📺 Sharing image in video feed for {duration}s")
+        logger.info(f"Sharing image in video feed for {duration}s")
 
     def get_visitor_count(self) -> int:
-        """
-        Get the current unique visitor count (for function calling).
-
-        Returns:
-            Number of unique faces detected in the time window
-        """
-        current_time = time.time()
-        self._cleanup_old_faces(current_time)
+        """Get the current unique visitor count."""
+        self._cleanup_old_faces(time.time())
         return len(self._detected_faces)
 
     def get_visitor_details(self) -> List[Dict[str, Any]]:
-        """
-        Get detailed information about all visitors.
-
-        Returns:
-            List of visitor details
-        """
-        current_time = time.time()
-        self._cleanup_old_faces(current_time)
-
-        visitors = []
-        for face in sorted(
-            self._detected_faces.values(), key=lambda f: f.last_seen, reverse=True
-        ):
-            visitors.append(
-                {
-                    "face_id": face.face_id[:8],  # Shortened ID
-                    "name": face.name,  # Will be None if unknown
-                    "is_known": face.name is not None,
-                    "first_seen": self._format_timestamp(face.first_seen),
-                    "last_seen": self._format_timestamp(face.last_seen),
-                    "detection_count": face.detection_count,
-                }
-            )
-
-        return visitors
+        """Get detailed information about all visitors."""
+        self._cleanup_old_faces(time.time())
+        return [
+            {
+                "face_id": f.face_id[:8],
+                "name": f.name,
+                "is_known": f.name is not None,
+                "first_seen": format_timestamp(f.first_seen),
+                "last_seen": format_timestamp(f.last_seen),
+                "detection_count": f.detection_count,
+            }
+            for f in sorted(self._detected_faces.values(), key=lambda x: x.last_seen, reverse=True)
+        ]
 
     def get_package_count(self) -> int:
-        """
-        Get the current unique package count (for function calling).
-
-        Returns:
-            Number of unique packages detected in the time window
-        """
-        current_time = time.time()
-        self._cleanup_old_packages(current_time)
+        """Get the current unique package count."""
+        self._cleanup_old_packages(time.time())
         return len(self._detected_packages)
 
     def get_package_details(self) -> List[Dict[str, Any]]:
-        """
-        Get detailed information about all packages.
-
-        Returns:
-            List of package details
-        """
-        current_time = time.time()
-        self._cleanup_old_packages(current_time)
-
-        packages = []
-        for package in sorted(
-            self._detected_packages.values(),
-            key=lambda p: p.last_seen,
-            reverse=True,
-        ):
-            packages.append(
-                {
-                    "package_id": package.package_id[:8],
-                    "first_seen": self._format_timestamp(package.first_seen),
-                    "last_seen": self._format_timestamp(package.last_seen),
-                    "detection_count": package.detection_count,
-                    "confidence": package.confidence,
-                }
-            )
-
-        return packages
+        """Get detailed information about all packages."""
+        self._cleanup_old_packages(time.time())
+        return [
+            {
+                "package_id": p.package_id[:8],
+                "first_seen": format_timestamp(p.first_seen),
+                "last_seen": format_timestamp(p.last_seen),
+                "detection_count": p.detection_count,
+                "confidence": p.confidence,
+            }
+            for p in sorted(self._detected_packages.values(), key=lambda x: x.last_seen, reverse=True)
+        ]
 
     def get_activity_log(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """
-        Get recent activity log entries.
-
-        Args:
-            limit: Maximum number of entries to return (default: 20)
-
-        Returns:
-            List of activity log entries, most recent first
-        """
-        entries = []
-        for entry in reversed(self._activity_log[-limit:]):
-            entries.append(
-                {
-                    "timestamp": self._format_timestamp(entry.timestamp),
-                    "event_type": entry.event_type,
-                    "description": entry.description,
-                    "details": entry.details,
-                }
-            )
-        return entries
+        """Get recent activity log entries."""
+        return [
+            {
+                "timestamp": format_timestamp(e.timestamp),
+                "event_type": e.event_type,
+                "description": e.description,
+                "details": e.details,
+            }
+            for e in reversed(self._activity_log[-limit:])
+        ]
 
     def register_known_face(self, name: str, face_encoding: np.ndarray) -> bool:
         """Register a face encoding with a name for future recognition."""
-        self._known_faces[name] = KnownFace(
-            name=name, face_encoding=face_encoding, registered_at=time.time()
-        )
+        self._known_faces[name] = KnownFace(name=name, face_encoding=face_encoding, registered_at=time.time())
         self._log_activity("face_registered", f"Registered: {name}", {"name": name})
-        logger.info(f"✅ Registered face: {name}")
+        logger.info(f"Registered face: {name}")
         return True
 
     def register_current_face_as(self, name: str) -> Dict[str, Any]:
-        """
-        Register the most recently detected face with a name.
-        Useful for "remember me as [name]" functionality.
-
-        Args:
-            name: Name to associate with the face
-
-        Returns:
-            Dict with success status and message
-        """
+        """Register the most recently detected face with a name."""
         if not self._detected_faces:
-            return {
-                "success": False,
-                "message": "No faces currently detected. Please make sure your face is visible.",
-            }
+            return {"success": False, "message": "No faces currently detected. Please make sure your face is visible."}
 
-        # Get the most recently seen face
-        most_recent_face = max(self._detected_faces.values(), key=lambda f: f.last_seen)
-
-        # Register the face encoding
-        self.register_known_face(name, most_recent_face.face_encoding)
-
-        # Update the face detection with the name
-        most_recent_face.name = name
+        most_recent = max(self._detected_faces.values(), key=lambda f: f.last_seen)
+        self.register_known_face(name, most_recent.face_encoding)
+        most_recent.name = name
 
         return {
             "success": True,
             "message": f"I'll remember you as {name}! Next time I see you, I'll recognize you.",
-            "face_id": most_recent_face.face_id[:8],
+            "face_id": most_recent.face_id[:8],
         }
 
     def get_known_faces(self) -> List[Dict[str, Any]]:
-        """
-        Get list of all registered known faces.
+        """Get list of all registered known faces."""
+        return [{"name": f.name, "registered_at": format_timestamp(f.registered_at)} for f in self._known_faces.values()]
 
-        Returns:
-            List of known face info
-        """
-        return [
-            {
-                "name": face.name,
-                "registered_at": self._format_timestamp(face.registered_at),
-            }
-            for face in self._known_faces.values()
-        ]
-
-    async def close(self):
+    async def close(self) -> None:
         """Clean up resources."""
         self._shutdown = True
         if self._video_forwarder is not None:
@@ -1739,4 +1043,4 @@ class SecurityCameraProcessor(VideoProcessorPublisher, Warmable[Optional[Any]]):
         self.executor.shutdown(wait=False)
         self._detected_faces.clear()
         self._detected_packages.clear()
-        logger.info("🛑 Security camera processor closed")
+        logger.info("Security camera processor closed")

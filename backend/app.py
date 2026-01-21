@@ -189,9 +189,11 @@ async def run_agent_in_background(call_id: str, model: str, example: str, user_n
 
         # 更新 Stream Chat 用戶名稱 (不設定 role 避免權限問題)
         stream_client.upsert_users(
-            UserRequest(id=human_id, name=user_name)
+            UserRequest(id=human_id, name=user_name),
+            UserRequest(id=agent.agent_user.id, name=agent.agent_user.name)
         )
         logger.info(f"✅ Updated Stream Chat user: {human_id} with name: {user_name}")
+        logger.info(f"✅ Updated Stream Chat user: {agent.agent_user.id} with name: {agent.agent_user.name}")
 
         stream_client.chat.get_or_create_channel(
             type="messaging",

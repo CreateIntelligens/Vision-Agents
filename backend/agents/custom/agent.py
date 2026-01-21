@@ -215,8 +215,13 @@ async def create_agent(call_id: str, user_name: str = "Human User") -> Agent:
     await sync_knowledge_store(file_search_store)
 
     # 使用 Gemini Realtime（支援視訊）
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    gemini_model = os.getenv("GEMINI_REALTIME_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
     llm = gemini.Realtime(
-        "gemini-2.5-flash-native-audio-preview-12-2025",
+        gemini_model,
         fps=2,  # 提高到 2 FPS 減少延遲（JPEG 壓縮後記憶體使用約 360-720MB/小時）
         enable_google_search=True,  # 啟用 Google Search 進行即時資訊查詢
     )
