@@ -1,7 +1,8 @@
 certs/
-csl
+csl/
 docs/plans/
 .serena/
+CLAUDE.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

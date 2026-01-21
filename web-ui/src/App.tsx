@@ -241,11 +241,11 @@ function App() {
               </div>
             </div>
 
-            <div className="security-bar">
-              <Lock size={12} />
-              <span>SECURITY CLEARANCE: LEVEL 5</span>
-              <div className="bar-fill" />
-            </div>
+          <div className="security-bar">
+            <Lock size={12} />
+            <span>CURRENT MODE: {selectedConfig.name}</span>
+            <div className="bar-fill" />
+          </div>
           </motion.header>
 
         <AnimatePresence mode="wait">
