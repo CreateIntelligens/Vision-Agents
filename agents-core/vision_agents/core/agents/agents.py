@@ -1395,9 +1395,9 @@ class Agent:
         # Variables are now initialized in __init__
 
         if self.publish_audio:
-            # Use 24kHz to match Gemini Realtime's output
-            # Gemini outputs 24kHz PCM, so we need to match it
-            framerate = 24000
+            # Stream SDK will automatically resample from 24kHz to 48kHz
+            # So we create a 48kHz track and let Stream handle the conversion
+            framerate = 48000
             stereo = False  # Gemini outputs mono
             self._audio_track = self.edge.create_audio_track(
                 framerate=framerate, stereo=stereo
@@ -1406,7 +1406,11 @@ class Agent:
             @self.events.subscribe
             async def forward_audio(event: RealtimeAudioOutputEvent):
                 if self._audio_track is not None:
+                    # Stream SDK's AudioStreamTrack.write() will automatically
+                    # resample from 24kHz (Gemini) to 48kHz (WebRTC standard)
                     await self._audio_track.write(event.data)
+                else:
+                    self.logger.error(f"❌ _audio_track is None, cannot write audio!")
 
         # Set up video track if video publishers are available
         if self.publish_video:
